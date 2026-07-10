@@ -122,17 +122,18 @@ Production tags:
 - Branch/SHA tags for traceable builds.
 - Release tag names when a Git tag is pushed.
 
-Development tags are published only by the manual `Build and publish dev container`
-GitHub Actions workflow:
+Development tags are published by the `Build and publish dev container`
+GitHub Actions workflow when changes are pushed to `dev`, or when the workflow is
+run manually:
 
 - `dev` for the latest manually published development image.
 - `dev-<shortsha>` for a pinned development image built from a specific commit.
 
-To publish a dev image, push the branch or commit you want to test, open GitHub
-Actions, run `Build and publish dev container`, and set `ref` to that branch,
-tag, or SHA. Deploy `ghcr.io/barryshtpeas/realdebrid-downloader:dev` for quick
-testing, or use the matching `dev-<shortsha>` tag when you want a rollback-safe
-pinned image. The dev workflow never updates `latest`.
+To publish a dev image, merge or push the change to `dev`. For an ad hoc build,
+open GitHub Actions, run `Build and publish dev container`, and set `ref` to a
+branch, tag, or SHA. Deploy `ghcr.io/barryshtpeas/realdebrid-downloader:dev` for
+quick testing, or use the matching `dev-<shortsha>` tag when you want a
+rollback-safe pinned image. The dev workflow never updates `latest`.
 
 Run the image directly:
 

@@ -1,12 +1,15 @@
 name: Build and publish dev container
 
 on:
+  push:
+    branches:
+      - dev
   workflow_dispatch:
     inputs:
       ref:
         description: "Branch, tag, or commit SHA to build"
         required: false
-        default: "main"
+        default: "dev"
 
 permissions:
   contents: read
@@ -26,7 +29,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,7 +49,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Resolve image version
         id: version
