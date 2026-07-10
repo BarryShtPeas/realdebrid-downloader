@@ -1,0 +1,31 @@
+services:
+  rd-downloader:
+    build: .
+    image: ghcr.io/barryshtpeas/realdebrid-downloader:dev
+    env_file:
+      - .env
+    environment:
+      ARIA2_RPC_URL: http://rd-aria2:6800/jsonrpc
+      APP_DOWNLOAD_DIR: /downloads
+      APP_CONFIG_DIR: /config
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config
+      - ./downloads:/downloads
+    depends_on:
+      - rd-aria2
+
+  rd-aria2:
+    image: p3terx/aria2-pro:latest
+    environment:
+      RPC_SECRET: ${ARIA2_RPC_SECRET:-}
+      RPC_PORT: 6800
+      LISTEN_PORT: 6888
+      DISK_CACHE: 64M
+      IPV6_MODE: "false"
+    volumes:
+      - ./aria2-config:/config
+      - ./downloads:/downloads
+    expose:
+      - "6800"
