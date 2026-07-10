@@ -20,7 +20,8 @@ The runtime model is:
 3. The app calls `/unrestrict/check` to check whether Real-Debrid currently has a downloadable file for that link.
 4. The app calls `/unrestrict/link` with the submitted URL.
 5. If Real-Debrid returns a generated direct download URL, the app submits it to aria2 using JSON-RPC.
-6. aria2 downloads the file to `/downloads`.
+6. The web UI shows the filename, aria2 id, and generated Real-Debrid direct download URL.
+7. aria2 downloads the file to `/downloads`.
 
 If supported-host data is unavailable or inconclusive, the app still attempts the unrestrict step. When Real-Debrid cannot produce a usable download URL, the web UI shows this user-facing message:
 
@@ -67,6 +68,25 @@ Copy `.env.example` to `.env` for local development and fill in only local secre
 | `ARIA2_MAX_CONNECTION_PER_SERVER` | no | `8` | aria2 connection tuning. |
 | `ARIA2_SPLIT` | no | `8` | aria2 split tuning. |
 
+## Queue Management
+
+Open `/queue` to view and manage the internal aria2 queue. The page is server-rendered and calls aria2 JSON-RPC from the app container, so the aria2 RPC endpoint and RPC secret are not exposed to the browser.
+
+The queue page shows:
+
+- Active downloads.
+- Waiting or paused downloads.
+- Recently stopped, completed, removed, or failed downloads.
+
+Supported controls:
+
+- Pause, resume, and remove active/waiting downloads.
+- Move waiting or paused downloads to the top, up, down, or bottom.
+- Clear individual stopped history entries.
+- Clear all stopped history entries.
+
+Queue actions redirect back to `/queue`. Refresh the page manually to update progress.
+
 ## Local Development
 
 ```bash
@@ -96,11 +116,23 @@ GitHub Actions publishes the public image to:
 ghcr.io/barryshtpeas/realdebrid-downloader
 ```
 
-Expected tags:
+Production tags:
 
 - `latest` from the default branch.
 - Branch/SHA tags for traceable builds.
 - Release tag names when a Git tag is pushed.
+
+Development tags are published only by the manual `Build and publish dev container`
+GitHub Actions workflow:
+
+- `dev` for the latest manually published development image.
+- `dev-<shortsha>` for a pinned development image built from a specific commit.
+
+To publish a dev image, push the branch or commit you want to test, open GitHub
+Actions, run `Build and publish dev container`, and set `ref` to that branch,
+tag, or SHA. Deploy `ghcr.io/barryshtpeas/realdebrid-downloader:dev` for quick
+testing, or use the matching `dev-<shortsha>` tag when you want a rollback-safe
+pinned image. The dev workflow never updates `latest`.
 
 Run the image directly:
 
@@ -151,7 +183,9 @@ To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, ngi
 - Never commit real Real-Debrid or GitHub tokens.
 - Never log full submitted URLs by default. The app logs only the submitted URL hostname, and the optional diagnostic flag still redacts path and query material.
 - Treat submitted URLs as private operator data.
+- The submit result page displays the generated Real-Debrid direct download URL in the browser UI. Protect the app route accordingly.
 - Keep aria2 JSON-RPC internal to the Docker network.
+- Queue controls can pause, resume, remove, and reorder downloads. Do not expose this app publicly without access control.
 - Do not expose `/downloads` through the web app unless an explicit authenticated browsing feature is added later.
 
 ## Implementation Status
