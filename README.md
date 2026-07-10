@@ -1,10 +1,10 @@
 # Real-Debrid Downloader
 
-Small private web app for submitting Real-Debrid-supported hoster links and handing the unrestricted download URL to an internal aria2 downloader.
+Small self-hosted web app for submitting Real-Debrid-supported hoster links and handing the unrestricted download URL to an internal aria2 downloader.
 
 ## Purpose
 
-This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs. It is intended for Grace as a lightweight replacement for keeping JDownloader2 running all the time.
+This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs. Paste a link, and the app unrestricts it through Real-Debrid and hands the direct download to an internal aria2 worker. It is a lightweight, always-on alternative to keeping a full desktop download manager running.
 
 The runtime model is:
 
@@ -90,7 +90,7 @@ docker compose -f compose.example.yml up --build
 
 ## Docker Image
 
-GitHub Actions publishes the private image to:
+GitHub Actions publishes the public image to:
 
 ```text
 ghcr.io/barryshtpeas/realdebrid-downloader
@@ -112,29 +112,39 @@ docker run --rm -p 8080:8080 \
   ghcr.io/barryshtpeas/realdebrid-downloader:latest
 ```
 
-## Grace Deployment Notes
+## Deploy with Docker Compose
 
-Grace deployment is owned by `BarryShtPeas/unraid`, not this repository.
+`compose.example.yml` is a ready-to-run stack (`rd-downloader` + `rd-aria2`).
 
-The intended services are:
+```bash
+cp .env.example .env
+# Edit .env: set REALDEBRID_API_TOKEN and ARIA2_RPC_SECRET,
+# and set DOWNLOAD_DIR to your own host download directory.
+chmod 600 .env
+docker compose -f compose.example.yml up -d
+```
 
-- `rd-downloader`: pulls `ghcr.io/barryshtpeas/realdebrid-downloader:latest`, uses Traefik host `rd.${DOMAIN}`, exposes no host port, and has `mem_limit: 128m`.
-- `rd-aria2`: internal-only aria2 JSON-RPC service, no Traefik route, no host port, and has `mem_limit: 128m`.
+Then open `http://localhost:8080`.
 
-Grace mounts:
+### Mapping your host download directory
 
-| Container path | Grace host path |
-| --- | --- |
-| `/config` | `${APPDATA_PATH}/rd-downloader` |
-| `/downloads` | `${DATA_PATH}/downloads/realdebrid` |
+aria2 writes completed files to `/downloads` inside the container. Point that at any host directory with `DOWNLOAD_DIR` in `.env`:
 
-Required Grace configuration:
+```env
+DOWNLOAD_DIR=/mnt/media/downloads
+```
 
-- `REALDEBRID_API_TOKEN` in the Grace live Docker environment.
-- GHCR pull authentication for the private package. Prefer a GitHub token with `read:packages` only.
-- `ARIA2_RPC_SECRET` shared between the app and `rd-aria2`.
+`CONFIG_DIR` and `ARIA2_CONFIG_DIR` map persistent app/aria2 state the same way. All default to local `./` folders if unset.
 
-Keep `JDownloader2` stopped under its existing on-demand profile as a fallback.
+### Keeping the API token secure
+
+- The Real-Debrid token is read only from `.env` via the compose `env_file` directive. It is never written into `compose.example.yml`.
+- `.env` is gitignored, so secrets are not committed. Run `chmod 600 .env` to restrict local read access.
+- For hardened setups, Docker secrets can be used instead of an env file.
+
+### Optional: reverse proxy
+
+To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, nginx) pointing at the `rd-downloader` container on port `8080`. Keep `rd-aria2` internal to the Docker network — do not expose its RPC port to the host.
 
 ## Security
 
@@ -147,3 +157,7 @@ Keep `JDownloader2` stopped under its existing on-demand profile as a fallback.
 ## Implementation Status
 
 The production Real-Debrid and aria2 workflow is implemented in `app/main.py` with mocked tests for Real-Debrid and aria2 responses. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
