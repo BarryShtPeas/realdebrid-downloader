@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import html
+import json
 import logging
 import os
+import re
 import uuid
-from dataclasses import dataclass
+from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode, urlparse
 
@@ -17,7 +23,25 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 NO_DOWNLOAD_MESSAGE = "No download available from Real-Debrid for this link."
 
 logger = logging.getLogger("rd_downloader")
-app = FastAPI(title="Real-Debrid Downloader")
+
+
+@asynccontextmanager
+async def lifespan(fastapi_app: FastAPI) -> Any:
+    settings = Settings.from_env()
+    task: asyncio.Task[Any] | None = None
+    if settings.group_poll_seconds > 0:
+        task = asyncio.create_task(group_monitor_loop(settings))
+        fastapi_app.state.group_monitor_task = task
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+app = FastAPI(title="Real-Debrid Downloader", lifespan=lifespan)
 
 
 @dataclass(frozen=True)
@@ -30,9 +54,14 @@ class Settings:
     aria2_max_connection_per_server: str
     aria2_split: str
     submitted_url_logging: bool
+    app_download_dir: str
+    group_state_file: str
+    extract_timeout_seconds: int
+    group_poll_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
+        config_dir = os.getenv("APP_CONFIG_DIR", "/config")
         return cls(
             realdebrid_api_token=os.getenv("REALDEBRID_API_TOKEN"),
             realdebrid_api_base_url=os.getenv(
@@ -49,10 +78,17 @@ class Settings:
             aria2_split=os.getenv("ARIA2_SPLIT", "8"),
             submitted_url_logging=os.getenv("APP_SUBMITTED_URL_LOGGING", "false").lower()
             in {"1", "true", "yes", "on"},
+            app_download_dir=os.getenv("APP_DOWNLOAD_DIR", "/downloads"),
+            group_state_file=os.getenv(
+                "APP_GROUP_STATE_FILE",
+                os.path.join(config_dir, "download-groups.json"),
+            ),
+            extract_timeout_seconds=parse_env_int("APP_EXTRACT_TIMEOUT_SECONDS", 7200),
+            group_poll_seconds=parse_env_int("APP_GROUP_POLL_SECONDS", 30),
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class DownloadResult:
     ok: bool
     message: str
@@ -60,6 +96,55 @@ class DownloadResult:
     filename: str | None = None
     direct_url: str | None = None
     host_supported: bool | None = None
+    group_id: str | None = None
+    local_path: str | None = None
+    submitted_hostname: str | None = None
+
+
+@dataclass(frozen=True)
+class SubmissionResult:
+    ok: bool
+    message: str
+    downloads: list[DownloadResult]
+    group: "DownloadGroup | None" = None
+
+
+@dataclass
+class DownloadGroupPart:
+    aria2_gid: str
+    filename: str | None
+    local_download_path: str | None
+    status: str
+    error: str | None = None
+    total_length: int = 0
+    completed_length: int = 0
+
+
+@dataclass
+class DownloadGroup:
+    id: str
+    name: str
+    created_at: str
+    updated_at: str
+    original_hosts: list[str]
+    parts: list[DownloadGroupPart]
+    extraction_status: str = "pending"
+    extraction_error: str | None = None
+    extraction_output_path: str | None = None
+
+    @property
+    def progress_percent(self) -> float:
+        total = sum(part.total_length for part in self.parts)
+        completed = sum(part.completed_length for part in self.parts)
+        if total <= 0:
+            if self.parts and all(part.status == "complete" for part in self.parts):
+                return 100.0
+            return 0.0
+        return min(100.0, (completed / total) * 100)
+
+    @property
+    def complete_parts(self) -> int:
+        return sum(1 for part in self.parts if part.status == "complete")
 
 
 @dataclass(frozen=True)
@@ -90,6 +175,188 @@ class QueueSnapshot:
     active: list[QueueItem]
     waiting: list[QueueItem]
     stopped: list[QueueItem]
+
+
+class GroupStateStore:
+    def __init__(self, state_file: str) -> None:
+        self.state_file = state_file
+
+    def load_groups(self) -> list[DownloadGroup]:
+        try:
+            with open(self.state_file, encoding="utf-8") as state:
+                payload = json.load(state)
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as exc:
+            logger.warning("Download group state could not be read: %s", exc)
+            return []
+
+        group_payloads = payload.get("groups") if isinstance(payload, dict) else None
+        if not isinstance(group_payloads, list):
+            return []
+        groups: list[DownloadGroup] = []
+        for item in group_payloads:
+            if not isinstance(item, dict):
+                continue
+            group = parse_download_group(item)
+            if group is not None:
+                groups.append(group)
+        return groups
+
+    def save_groups(self, groups: list[DownloadGroup]) -> None:
+        parent = os.path.dirname(self.state_file) or "."
+        os.makedirs(parent, exist_ok=True)
+        payload = {"groups": [group_to_dict(group) for group in groups]}
+        temp_file = os.path.join(parent, f".{os.path.basename(self.state_file)}.{uuid.uuid4().hex}.tmp")
+        with open(temp_file, "w", encoding="utf-8") as state:
+            json.dump(payload, state, indent=2, sort_keys=True)
+            state.write("\n")
+        os.replace(temp_file, self.state_file)
+
+    def add_group(self, group: DownloadGroup) -> None:
+        groups = self.load_groups()
+        groups.append(group)
+        self.save_groups(groups)
+
+    def update_group(self, group: DownloadGroup) -> None:
+        groups = self.load_groups()
+        for index, existing in enumerate(groups):
+            if existing.id == group.id:
+                groups[index] = group
+                break
+        else:
+            groups.append(group)
+        self.save_groups(groups)
+
+
+def parse_download_group(payload: dict[str, Any]) -> DownloadGroup | None:
+    group_id = payload.get("id")
+    name = payload.get("name")
+    parts_payload = payload.get("parts")
+    if not isinstance(group_id, str) or not group_id:
+        return None
+    if not isinstance(name, str) or not name:
+        name = f"download-group-{group_id[:8]}"
+    if not isinstance(parts_payload, list):
+        parts_payload = []
+
+    parts: list[DownloadGroupPart] = []
+    for part_payload in parts_payload:
+        if not isinstance(part_payload, dict):
+            continue
+        gid = part_payload.get("aria2_gid")
+        if not isinstance(gid, str) or not gid:
+            continue
+        filename = part_payload.get("filename")
+        local_path = part_payload.get("local_download_path")
+        status = part_payload.get("status")
+        error = part_payload.get("error")
+        parts.append(
+            DownloadGroupPart(
+                aria2_gid=gid,
+                filename=filename if isinstance(filename, str) and filename else None,
+                local_download_path=local_path if isinstance(local_path, str) and local_path else None,
+                status=status if isinstance(status, str) and status else "unknown",
+                error=error if isinstance(error, str) and error else None,
+                total_length=parse_int(part_payload.get("total_length")),
+                completed_length=parse_int(part_payload.get("completed_length")),
+            ),
+        )
+
+    original_hosts = payload.get("original_hosts")
+    if not isinstance(original_hosts, list):
+        original_hosts = []
+    hosts = [host for host in original_hosts if isinstance(host, str) and host]
+    created_at = payload.get("created_at")
+    updated_at = payload.get("updated_at")
+    extraction_status = payload.get("extraction_status")
+    extraction_error = payload.get("extraction_error")
+    extraction_output_path = payload.get("extraction_output_path")
+    return DownloadGroup(
+        id=group_id,
+        name=safe_group_name(name, fallback=f"download-group-{group_id[:8]}"),
+        created_at=created_at if isinstance(created_at, str) else now_iso(),
+        updated_at=updated_at if isinstance(updated_at, str) else now_iso(),
+        original_hosts=hosts,
+        parts=parts,
+        extraction_status=extraction_status
+        if extraction_status in {"pending", "extracting", "complete", "failed"}
+        else "pending",
+        extraction_error=extraction_error if isinstance(extraction_error, str) and extraction_error else None,
+        extraction_output_path=extraction_output_path
+        if isinstance(extraction_output_path, str) and extraction_output_path
+        else None,
+    )
+
+
+def group_to_dict(group: DownloadGroup) -> dict[str, Any]:
+    return asdict(group)
+
+
+URL_PATTERN = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
+URL_LEADING_TRIM = "([{'\""
+URL_TRAILING_TRIM = ".,;:!?)]}'\""
+
+
+def extract_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in URL_PATTERN.finditer(text):
+        url = match.group(0).strip(URL_LEADING_TRIM).rstrip(URL_TRAILING_TRIM)
+        if url and url not in seen:
+            urls.append(url)
+            seen.add(url)
+    return urls
+
+
+def submitted_hostname(submitted_url: str) -> str:
+    parsed = urlparse(submitted_url)
+    return parsed.hostname.lower() if parsed.hostname else "unknown-host"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def derive_group_name(filenames: list[str | None], fallback: str) -> str:
+    for filename in filenames:
+        if not filename:
+            continue
+        base = os.path.basename(filename)
+        part_match = re.match(r"(?P<name>.+?)\.part0*1\.rar$", base, flags=re.IGNORECASE)
+        if part_match:
+            return safe_group_name(part_match.group("name"), fallback)
+    for filename in filenames:
+        if not filename:
+            continue
+        base = os.path.basename(filename)
+        generic_match = re.match(r"(?P<name>.+?)\.(rar|zip|7z)$", base, flags=re.IGNORECASE)
+        if generic_match:
+            return safe_group_name(generic_match.group("name"), fallback)
+    for filename in filenames:
+        if filename:
+            return safe_group_name(Path(filename).stem, fallback)
+    return fallback
+
+
+def safe_group_name(value: str, fallback: str = "download-group") -> str:
+    basename = os.path.basename(value).strip().strip(".")
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", basename)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned[:120] or fallback
+
+
+def local_download_path(download_dir: str, filename: str | None) -> str | None:
+    if not filename:
+        return None
+    return os.path.join(download_dir, os.path.basename(filename))
+
+
+def parse_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 class DownloadUnavailableError(Exception):
@@ -258,6 +525,12 @@ class Aria2Client:
     async def tell_stopped(self, offset: int = 0, num: int = 50) -> list[dict[str, Any]]:
         return await self._rpc_list("aria2.tellStopped", [offset, num])
 
+    async def tell_status(self, gid: str) -> dict[str, Any]:
+        result = await self._rpc("aria2.tellStatus", [gid])
+        if not isinstance(result, dict):
+            raise UpstreamError("aria2 returned an unexpected status response.")
+        return result
+
     async def pause(self, gid: str) -> None:
         await self._rpc("aria2.pause", [gid])
 
@@ -330,8 +603,70 @@ class Downloader:
         self.settings = settings
         self.realdebrid = RealDebridClient(settings)
         self.aria2 = Aria2Client(settings)
+        self.group_store = GroupStateStore(settings.group_state_file)
+
+    async def submit_text(self, submitted_text: str) -> SubmissionResult:
+        urls = extract_urls(submitted_text)
+        if not urls:
+            return SubmissionResult(
+                ok=False,
+                message="Paste at least one valid http:// or https:// URL.",
+                downloads=[],
+            )
+        return await self.submit_urls(urls)
 
     async def submit(self, submitted_url: str) -> DownloadResult:
+        submission = await self.submit_urls([submitted_url])
+        if submission.downloads:
+            return submission.downloads[0]
+        return DownloadResult(ok=False, message=submission.message)
+
+    async def submit_urls(self, submitted_urls: list[str]) -> SubmissionResult:
+        results: list[DownloadResult] = []
+        for submitted_url in submitted_urls:
+            try:
+                results.append(await self._submit_one(submitted_url))
+            except DownloadUnavailableError:
+                results.append(
+                    DownloadResult(
+                        ok=False,
+                        message=NO_DOWNLOAD_MESSAGE,
+                        submitted_hostname=submitted_hostname(submitted_url),
+                    ),
+                )
+            except (ConfigurationError, UpstreamError):
+                raise
+
+        submitted = [result for result in results if result.ok and result.aria2_gid]
+        group: DownloadGroup | None = None
+        if submitted:
+            group = self._create_group(submitted_urls, submitted)
+            self.group_store.add_group(group)
+            for result in submitted:
+                result.group_id = group.id
+
+        if len(results) == 1:
+            result = results[0]
+            return SubmissionResult(ok=result.ok, message=result.message, downloads=results, group=group)
+
+        failed_count = len([result for result in results if not result.ok])
+        if submitted and failed_count:
+            message = f"Submitted {len(submitted)} of {len(results)} parts to aria2. {failed_count} part(s) failed."
+            return SubmissionResult(ok=True, message=message, downloads=results, group=group)
+        if submitted:
+            return SubmissionResult(
+                ok=True,
+                message=f"Submitted {len(submitted)} parts to aria2 as one multipart group.",
+                downloads=results,
+                group=group,
+            )
+        return SubmissionResult(
+            ok=False,
+            message=NO_DOWNLOAD_MESSAGE,
+            downloads=results,
+        )
+
+    async def _submit_one(self, submitted_url: str) -> DownloadResult:
         self._log_submission(submitted_url)
         host_supported = await self._host_supported(submitted_url)
 
@@ -359,13 +694,54 @@ class Downloader:
 
         gid = await self.aria2.add_uri(direct_url)
         filename = unrestricted.get("filename")
+        safe_filename = filename if isinstance(filename, str) else None
         return DownloadResult(
             ok=True,
             message="Download submitted to aria2.",
             aria2_gid=gid,
-            filename=filename if isinstance(filename, str) else None,
+            filename=safe_filename,
             direct_url=direct_url,
             host_supported=host_supported,
+            local_path=local_download_path(self.settings.aria2_download_dir, safe_filename),
+            submitted_hostname=submitted_hostname(submitted_url),
+        )
+
+    def _create_group(
+        self,
+        submitted_urls: list[str],
+        submitted: list[DownloadResult],
+    ) -> DownloadGroup:
+        group_id = uuid.uuid4().hex
+        now = now_iso()
+        name = derive_group_name(
+            [result.filename for result in submitted],
+            fallback=f"download-group-{group_id[:8]}",
+        )
+        hosts: list[str] = []
+        seen_hosts: set[str] = set()
+        for submitted_url in submitted_urls:
+            host = submitted_hostname(submitted_url)
+            if host not in seen_hosts:
+                hosts.append(host)
+                seen_hosts.add(host)
+
+        return DownloadGroup(
+            id=group_id,
+            name=name,
+            created_at=now,
+            updated_at=now,
+            original_hosts=hosts,
+            parts=[
+                DownloadGroupPart(
+                    aria2_gid=result.aria2_gid or "",
+                    filename=result.filename,
+                    local_download_path=result.local_path,
+                    status="submitted",
+                )
+                for result in submitted
+                if result.aria2_gid
+            ],
+            extraction_status="pending",
         )
 
     async def _host_supported(self, submitted_url: str) -> bool | None:
@@ -387,6 +763,165 @@ class Downloader:
         logger.info("Received submitted hoster URL for host=%s", host)
 
 
+class GroupMonitor:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.aria2 = Aria2Client(settings)
+        self.group_store = GroupStateStore(settings.group_state_file)
+
+    async def poll_once(self) -> None:
+        groups = self.group_store.load_groups()
+        if not groups:
+            return
+
+        changed = False
+        for group in groups:
+            group_changed = await self._refresh_group(group)
+            if await self._maybe_extract(group):
+                group_changed = True
+            if group_changed:
+                group.updated_at = now_iso()
+                changed = True
+
+        if changed:
+            self.group_store.save_groups(groups)
+
+    async def _refresh_group(self, group: DownloadGroup) -> bool:
+        changed = False
+        for part in group.parts:
+            try:
+                status_payload = await self.aria2.tell_status(part.aria2_gid)
+            except UpstreamError as exc:
+                logger.info("aria2 status lookup failed for tracked group part: %s", exc)
+                continue
+
+            status = str(status_payload.get("status") or part.status)
+            total_length = parse_int(status_payload.get("totalLength"))
+            completed_length = parse_int(status_payload.get("completedLength"))
+            error_message = status_payload.get("errorMessage")
+            filename = queue_item_name(status_payload)
+            path = queue_item_path(status_payload)
+
+            if filename and filename != part.filename:
+                part.filename = filename
+                changed = True
+            if path and path != part.local_download_path:
+                part.local_download_path = path
+                changed = True
+            if status != part.status:
+                part.status = status
+                changed = True
+            if total_length != part.total_length:
+                part.total_length = total_length
+                changed = True
+            if completed_length != part.completed_length:
+                part.completed_length = completed_length
+                changed = True
+            normalized_error = error_message if isinstance(error_message, str) and error_message else None
+            if normalized_error != part.error:
+                part.error = normalized_error
+                changed = True
+
+        derived_name = derive_group_name(
+            [part.filename or part.local_download_path for part in group.parts],
+            fallback=group.name,
+        )
+        if derived_name != group.name:
+            group.name = derived_name
+            changed = True
+        return changed
+
+    async def _maybe_extract(self, group: DownloadGroup) -> bool:
+        if group.extraction_status not in {"pending", "extracting"}:
+            return False
+        if not group.parts or not all(part.status == "complete" for part in group.parts):
+            return False
+
+        archive_paths = [part.local_download_path for part in group.parts if part.local_download_path]
+        start_file = select_archive_start_file(archive_paths)
+        if start_file is None:
+            group.extraction_status = "failed"
+            group.extraction_error = "Could not find a supported archive start file."
+            return True
+
+        output_dir = os.path.join(self.settings.app_download_dir, safe_group_name(group.name))
+        group.extraction_status = "extracting"
+        group.extraction_error = None
+        group.extraction_output_path = output_dir
+        self.group_store.update_group(group)
+
+        result = await extract_archive(
+            start_file=start_file,
+            output_dir=output_dir,
+            timeout_seconds=self.settings.extract_timeout_seconds,
+        )
+        if result.ok:
+            for archive_path in archive_paths:
+                with suppress(FileNotFoundError):
+                    os.remove(archive_path)
+            group.extraction_status = "complete"
+            group.extraction_error = None
+        else:
+            group.extraction_status = "failed"
+            group.extraction_error = result.message
+        return True
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    ok: bool
+    message: str | None = None
+
+
+def select_archive_start_file(paths: list[str]) -> str | None:
+    existing_paths = [path for path in paths if path]
+    priority_patterns = [
+        re.compile(r"\.part0*1\.rar$", re.IGNORECASE),
+        re.compile(r"\.rar$", re.IGNORECASE),
+        re.compile(r"\.zip$", re.IGNORECASE),
+        re.compile(r"\.7z$", re.IGNORECASE),
+    ]
+    for pattern in priority_patterns:
+        for path in sorted(existing_paths):
+            if pattern.search(path):
+                return path
+    return None
+
+
+async def extract_archive(
+    start_file: str,
+    output_dir: str,
+    timeout_seconds: int,
+) -> ExtractionResult:
+    os.makedirs(output_dir, exist_ok=True)
+    process = await asyncio.create_subprocess_exec(
+        "7z",
+        "x",
+        start_file,
+        f"-o{output_dir}",
+        "-y",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=max(timeout_seconds, 1),
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        return ExtractionResult(ok=False, message="Archive extraction timed out.")
+
+    if process.returncode == 0:
+        return ExtractionResult(ok=True)
+    output = (stderr or stdout).decode("utf-8", errors="replace").strip()
+    return ExtractionResult(
+        ok=False,
+        message=output[:500] or "Archive extraction failed.",
+    )
+
+
 def get_downloader() -> Downloader:
     return Downloader(Settings.from_env())
 
@@ -395,9 +930,23 @@ def get_aria2_client() -> Aria2Client:
     return Aria2Client(Settings.from_env())
 
 
+def get_group_store() -> GroupStateStore:
+    return GroupStateStore(Settings.from_env().group_state_file)
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+async def group_monitor_loop(settings: Settings) -> None:
+    monitor = GroupMonitor(settings)
+    while True:
+        try:
+            await monitor.poll_once()
+        except Exception as exc:
+            logger.warning("Download group monitor failed: %s", exc)
+        await asyncio.sleep(settings.group_poll_seconds)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -411,7 +960,10 @@ async def submit(
     downloader: Downloader = Depends(get_downloader),
 ) -> str:
     try:
-        result = await downloader.submit(url)
+        if hasattr(downloader, "submit_text"):
+            result = await downloader.submit_text(url)
+        else:
+            result = await downloader.submit(url)
     except ConfigurationError as exc:
         logger.warning("Downloader configuration error: %s", exc)
         result = DownloadResult(ok=False, message=str(exc))
@@ -432,14 +984,17 @@ async def queue(
     message: Optional[str] = Query(None),
     level: str = Query("success"),
     aria2: Aria2Client = Depends(get_aria2_client),
+    group_store: GroupStateStore = Depends(get_group_store),
 ) -> str:
     try:
         snapshot = await aria2.queue_snapshot()
-        return render_queue_page(snapshot, message=message, level=level)
+        groups = group_store.load_groups()
+        return render_queue_page(snapshot, groups=groups, message=message, level=level)
     except UpstreamError as exc:
         logger.warning("aria2 queue read failed: %s", exc)
         return render_queue_page(
             None,
+            groups=group_store.load_groups(),
             message="Download queue is temporarily unavailable.",
             level="error",
         )
@@ -511,22 +1066,33 @@ def queue_redirect(message: str, level: str) -> RedirectResponse:
     return RedirectResponse(f"/queue?{query}", status_code=303)
 
 
-def render_page(result: DownloadResult | None = None) -> str:
+def render_page(result: DownloadResult | SubmissionResult | None = None) -> str:
     result_html = ""
     if result is not None:
         status = "success" if result.ok else "error"
         details: list[str] = []
-        if result.filename:
-            details.append(f"File: {html.escape(result.filename)}")
-        if result.aria2_gid:
-            details.append(f"aria2 id: {html.escape(result.aria2_gid)}")
-        if result.direct_url:
-            escaped_url = html.escape(result.direct_url, quote=True)
+        downloads = result.downloads if isinstance(result, SubmissionResult) else [result]
+        successful_downloads = [download for download in downloads if download.ok]
+        if isinstance(result, SubmissionResult) and result.group:
             details.append(
-                f'Real-Debrid URL: <a href="{escaped_url}">{html.escape(result.direct_url)}</a>',
+                f"Group: {html.escape(result.group.name)} ({len(result.group.parts)} part(s))",
             )
-        if result.host_supported is False:
-            details.append("Real-Debrid did not list this host, but unrestrict was attempted.")
+        for download in successful_downloads:
+            if download.filename:
+                details.append(f"File: {html.escape(download.filename)}")
+            if download.aria2_gid:
+                details.append(f"aria2 id: {html.escape(download.aria2_gid)}")
+            if download.direct_url:
+                escaped_url = html.escape(download.direct_url, quote=True)
+                details.append(
+                    f'Real-Debrid URL: <a href="{escaped_url}">{html.escape(download.direct_url)}</a>',
+                )
+            if download.host_supported is False:
+                details.append("Real-Debrid did not list this host, but unrestrict was attempted.")
+        failed_downloads = [download for download in downloads if not download.ok]
+        for failed in failed_downloads:
+            host = failed.submitted_hostname or "unknown host"
+            details.append(f"{html.escape(host)}: {html.escape(failed.message)}")
         detail_html = "".join(f"<p>{detail}</p>" for detail in details)
         result_html = (
             f'<section class="result {status}" role="status">'
@@ -620,17 +1186,18 @@ def render_page(result: DownloadResult | None = None) -> str:
             font-weight: 650;
             gap: .45rem;
           }}
-          input, button {{
+          textarea, button {{
             border-radius: 8px;
             font: inherit;
-            min-height: 3rem;
             width: 100%;
           }}
-          input {{
+          textarea {{
             background: var(--control);
             border: 1px solid var(--line);
             color: var(--fg);
+            min-height: 11rem;
             padding: .75rem .85rem;
+            resize: vertical;
           }}
           button {{
             background: var(--accent);
@@ -673,8 +1240,8 @@ def render_page(result: DownloadResult | None = None) -> str:
           {result_html}
           <form method="post" action="/submit">
             <label>
-              Hoster URL
-              <input name="url" type="url" required autocomplete="off" placeholder="https://example.com/file">
+              Hoster URLs
+              <textarea name="url" required autocomplete="off" placeholder="Paste one URL or a block of text containing multiple URLs"></textarea>
             </label>
             <button type="submit">Submit to aria2</button>
           </form>
@@ -686,6 +1253,7 @@ def render_page(result: DownloadResult | None = None) -> str:
 
 def render_queue_page(
     snapshot: QueueSnapshot | None,
+    groups: list[DownloadGroup] | None = None,
     message: str | None = None,
     level: str = "success",
 ) -> str:
@@ -702,6 +1270,7 @@ def render_queue_page(
     if snapshot is not None:
         sections = "\n".join(
             [
+                render_group_section(groups or []),
                 render_queue_section("Active", snapshot.active, "No active downloads."),
                 render_queue_section("Waiting", snapshot.waiting, "No waiting downloads."),
                 render_queue_section(
@@ -810,6 +1379,17 @@ def render_queue_page(
             margin: 0 0 .65rem;
             overflow-wrap: anywhere;
           }}
+          .parts {{
+            border-top: 1px solid var(--line);
+            display: grid;
+            gap: .35rem;
+            margin-top: .8rem;
+            padding-top: .8rem;
+          }}
+          .part {{
+            color: var(--muted);
+            overflow-wrap: anywhere;
+          }}
           .meta {{
             color: var(--muted);
             display: grid;
@@ -873,13 +1453,62 @@ def render_queue_page(
             <a href="/queue">Queue</a>
           </nav>
           <h1>Download Queue</h1>
-          <p>Manage active, waiting, and recently stopped aria2 downloads.</p>
+          <p>Manage active, waiting, and recently stopped aria2 downloads and multipart extraction groups.</p>
           {message_html}
           {sections}
         </main>
       </body>
     </html>
     """
+
+
+def render_group_section(groups: list[DownloadGroup]) -> str:
+    heading = "<h2>Multipart Groups</h2>"
+    if not groups:
+        return f"{heading}<p>No multipart groups yet.</p>"
+    newest_first = sorted(groups, key=lambda group: group.created_at, reverse=True)
+    return heading + "".join(render_group_item(group) for group in newest_first)
+
+
+def render_group_item(group: DownloadGroup) -> str:
+    progress = f"{group.progress_percent:.1f}"
+    statuses = {part.status for part in group.parts}
+    group_status = "complete" if statuses == {"complete"} else ", ".join(sorted(statuses)) or "unknown"
+    meta = [
+        f"Status: {html.escape(group_status)}",
+        f"Parts: {group.complete_parts} / {len(group.parts)} complete",
+        f"Extraction: {html.escape(group.extraction_status)}",
+    ]
+    if group.extraction_output_path and group.extraction_status == "complete":
+        meta.append(f"Extracted to: {html.escape(group.extraction_output_path)}")
+    if group.extraction_error:
+        meta.append(f"Extraction error: {html.escape(group.extraction_error)}")
+    if group.original_hosts:
+        meta.append("Source hosts: " + html.escape(", ".join(group.original_hosts)))
+
+    part_rows = []
+    for index, part in enumerate(group.parts, start=1):
+        name = part.filename or part.local_download_path or part.aria2_gid
+        size = ""
+        if part.total_length:
+            size = f" ({format_bytes(part.completed_length)} / {format_bytes(part.total_length)})"
+        error = f" - {html.escape(part.error)}" if part.error else ""
+        part_rows.append(
+            f'<span class="part">{index}. {html.escape(name)} - {html.escape(part.status)}{size}{error}</span>',
+        )
+
+    meta_html = "".join(f"<span>{entry}</span>" for entry in meta)
+    parts_html = "".join(part_rows)
+    return (
+        '<article class="item">'
+        f"<h3>{html.escape(group.name)}</h3>"
+        f'<div class="meta">{meta_html}</div>'
+        '<div class="progress" aria-hidden="true">'
+        f'<span style="width: {progress}%"></span>'
+        "</div>"
+        f'<div class="parts">{parts_html}</div>'
+        "</article>"
+    )
 
 
 def render_queue_section(
@@ -1032,6 +1661,19 @@ def queue_item_name(payload: dict[str, Any]) -> str:
                                 return f"Download from {parsed.hostname}"
 
     return f"Download {payload.get('gid') or 'unknown'}"
+
+
+def queue_item_path(payload: dict[str, Any]) -> str | None:
+    files = payload.get("files")
+    if not isinstance(files, list):
+        return None
+    for file_payload in files:
+        if not isinstance(file_payload, dict):
+            continue
+        path = file_payload.get("path")
+        if isinstance(path, str) and path:
+            return path
+    return None
 
 
 def parse_int(value: Any) -> int:

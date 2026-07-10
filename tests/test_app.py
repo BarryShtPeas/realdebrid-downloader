@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import tempfile
+import uuid
 from typing import Any
 
 import anyio
@@ -419,6 +421,299 @@ def test_queue_page_handles_aria2_failure_without_leaking_secret() -> None:
     anyio.run(run_test)
 
 
+def test_extract_urls_from_free_text() -> None:
+    text = """
+    Here are links:
+    "https://rapidgator.example/file.part1.rar",
+    (https://rapidgator.example/file.part2.rar)
+    duplicate: https://rapidgator.example/file.part1.rar
+    not a url: example.com/file
+    [http://host.example/archive.zip].
+    """
+
+    assert main.extract_urls(text) == [
+        "https://rapidgator.example/file.part1.rar",
+        "https://rapidgator.example/file.part2.rar",
+        "http://host.example/archive.zip",
+    ]
+
+
+def test_multi_url_submit_creates_group_and_does_not_persist_submitted_urls(
+    tmp_path: Any,
+) -> None:
+    async def run_test() -> None:
+        settings = make_settings(group_state_file=str(tmp_path / "groups.json"))
+        downloader = Downloader(settings)
+        submitted_to_aria2: list[str] = []
+
+        class FakeRealDebrid:
+            async def supported_domains(self) -> set[str]:
+                return {"rapidgator.example"}
+
+            async def check_link(self, submitted_url: str) -> dict[str, Any]:
+                return {"supported": 1}
+
+            async def unrestrict_link(self, submitted_url: str) -> dict[str, Any]:
+                basename = submitted_url.rsplit("/", 1)[-1].split("?", 1)[0]
+                return {
+                    "download": f"https://download.example/{basename}?rd=secret",
+                    "filename": basename,
+                }
+
+        class FakeAria2:
+            async def add_uri(self, direct_url: str) -> str:
+                submitted_to_aria2.append(direct_url)
+                return f"gid-{len(submitted_to_aria2)}"
+
+        downloader.realdebrid = FakeRealDebrid()  # type: ignore[assignment]
+        downloader.aria2 = FakeAria2()  # type: ignore[assignment]
+
+        submission = await downloader.submit_text(
+            "first https://rapidgator.example/private/movie.part1.rar?token=one\n"
+            "second https://rapidgator.example/private/movie.part2.rar?token=two",
+        )
+
+        assert submission.ok is True
+        assert submission.group is not None
+        assert submission.group.name == "movie"
+        assert [part.aria2_gid for part in submission.group.parts] == ["gid-1", "gid-2"]
+        assert submitted_to_aria2 == [
+            "https://download.example/movie.part1.rar?rd=secret",
+            "https://download.example/movie.part2.rar?rd=secret",
+        ]
+        persisted = (tmp_path / "groups.json").read_text()
+        assert "rapidgator.example" in persisted
+        assert "token=one" not in persisted
+        assert "/private/" not in persisted
+
+    anyio.run(run_test)
+
+
+def test_multi_url_partial_failure_creates_partial_group(tmp_path: Any) -> None:
+    async def run_test() -> None:
+        settings = make_settings(group_state_file=str(tmp_path / "groups.json"))
+        downloader = Downloader(settings)
+
+        class FakeRealDebrid:
+            async def supported_domains(self) -> None:
+                return None
+
+            async def check_link(self, submitted_url: str) -> dict[str, Any]:
+                return {}
+
+            async def unrestrict_link(self, submitted_url: str) -> dict[str, Any]:
+                if "bad" in submitted_url:
+                    raise main.DownloadUnavailableError
+                return {
+                    "download": "https://download.example/movie.part1.rar",
+                    "filename": "movie.part1.rar",
+                }
+
+        class FakeAria2:
+            async def add_uri(self, direct_url: str) -> str:
+                return "gid-ok"
+
+        downloader.realdebrid = FakeRealDebrid()  # type: ignore[assignment]
+        downloader.aria2 = FakeAria2()  # type: ignore[assignment]
+
+        submission = await downloader.submit_text(
+            "https://rapidgator.example/movie.part1.rar\n"
+            "https://rapidgator.example/bad.part2.rar",
+        )
+
+        assert submission.ok is True
+        assert "Submitted 1 of 2 parts" in submission.message
+        assert submission.group is not None
+        assert len(submission.group.parts) == 1
+        assert [download.ok for download in submission.downloads] == [True, False]
+
+    anyio.run(run_test)
+
+
+def test_group_state_round_trip_uses_atomic_replace(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    state_file = tmp_path / "groups.json"
+    store = main.GroupStateStore(str(state_file))
+    replacements: list[tuple[str, str]] = []
+    original_replace = main.os.replace
+
+    def recording_replace(source: str, target: str) -> None:
+        replacements.append((source, target))
+        original_replace(source, target)
+
+    monkeypatch.setattr(main.os, "replace", recording_replace)
+    group = main.DownloadGroup(
+        id="group-1",
+        name="release",
+        created_at="2026-07-10T00:00:00+00:00",
+        updated_at="2026-07-10T00:00:00+00:00",
+        original_hosts=["rapidgator.example"],
+        parts=[
+            main.DownloadGroupPart(
+                aria2_gid="gid-1",
+                filename="release.part1.rar",
+                local_download_path="/downloads/release.part1.rar",
+                status="complete",
+            ),
+        ],
+    )
+
+    store.save_groups([group])
+    loaded = store.load_groups()
+
+    assert replacements
+    assert replacements[0][1] == str(state_file)
+    assert loaded[0].name == "release"
+    assert loaded[0].parts[0].aria2_gid == "gid-1"
+
+
+def test_group_name_derivation_from_part_filename() -> None:
+    assert (
+        main.derive_group_name(["Show.Name.S01.part01.rar", "Show.Name.S01.part02.rar"], "fallback")
+        == "Show.Name.S01"
+    )
+
+
+def test_extraction_waits_until_all_parts_complete(tmp_path: Any) -> None:
+    async def run_test() -> None:
+        settings = make_settings(
+            app_download_dir=str(tmp_path / "downloads"),
+            group_state_file=str(tmp_path / "groups.json"),
+        )
+        monitor = main.GroupMonitor(settings)
+        group = main.DownloadGroup(
+            id="group-1",
+            name="release",
+            created_at=main.now_iso(),
+            updated_at=main.now_iso(),
+            original_hosts=[],
+            parts=[
+                main.DownloadGroupPart("gid-1", "release.part1.rar", str(tmp_path / "release.part1.rar"), "complete"),
+                main.DownloadGroupPart("gid-2", "release.part2.rar", str(tmp_path / "release.part2.rar"), "active"),
+            ],
+        )
+
+        assert await monitor._maybe_extract(group) is False
+        assert group.extraction_status == "pending"
+
+    anyio.run(run_test)
+
+
+def test_extraction_uses_first_archive_part_and_deletes_after_success(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_test() -> None:
+        downloads = tmp_path / "downloads"
+        downloads.mkdir()
+        part1 = downloads / "release.part1.rar"
+        part2 = downloads / "release.part2.rar"
+        part1.write_text("part1")
+        part2.write_text("part2")
+        calls: list[tuple[str, str, int]] = []
+
+        async def fake_extract_archive(start_file: str, output_dir: str, timeout_seconds: int) -> main.ExtractionResult:
+            calls.append((start_file, output_dir, timeout_seconds))
+            return main.ExtractionResult(ok=True)
+
+        monkeypatch.setattr(main, "extract_archive", fake_extract_archive)
+        settings = make_settings(
+            app_download_dir=str(downloads),
+            group_state_file=str(tmp_path / "groups.json"),
+            extract_timeout_seconds=42,
+        )
+        monitor = main.GroupMonitor(settings)
+        group = main.DownloadGroup(
+            id="group-1",
+            name="release",
+            created_at=main.now_iso(),
+            updated_at=main.now_iso(),
+            original_hosts=[],
+            parts=[
+                main.DownloadGroupPart("gid-1", "release.part2.rar", str(part2), "complete"),
+                main.DownloadGroupPart("gid-2", "release.part1.rar", str(part1), "complete"),
+            ],
+        )
+
+        assert await monitor._maybe_extract(group) is True
+        assert calls == [(str(part1), str(downloads / "release"), 42)]
+        assert group.extraction_status == "complete"
+        assert not part1.exists()
+        assert not part2.exists()
+
+    anyio.run(run_test)
+
+
+def test_extraction_failure_keeps_archive_parts(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_test() -> None:
+        downloads = tmp_path / "downloads"
+        downloads.mkdir()
+        part1 = downloads / "release.rar"
+        part1.write_text("part1")
+
+        async def fake_extract_archive(start_file: str, output_dir: str, timeout_seconds: int) -> main.ExtractionResult:
+            return main.ExtractionResult(ok=False, message="bad archive")
+
+        monkeypatch.setattr(main, "extract_archive", fake_extract_archive)
+        settings = make_settings(
+            app_download_dir=str(downloads),
+            group_state_file=str(tmp_path / "groups.json"),
+        )
+        monitor = main.GroupMonitor(settings)
+        group = main.DownloadGroup(
+            id="group-1",
+            name="release",
+            created_at=main.now_iso(),
+            updated_at=main.now_iso(),
+            original_hosts=[],
+            parts=[main.DownloadGroupPart("gid-1", "release.rar", str(part1), "complete")],
+        )
+
+        assert await monitor._maybe_extract(group) is True
+        assert group.extraction_status == "failed"
+        assert group.extraction_error == "bad archive"
+        assert part1.exists()
+
+    anyio.run(run_test)
+
+
+def test_extracting_group_is_resumable_after_restart(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_test() -> None:
+        downloads = tmp_path / "downloads"
+        downloads.mkdir()
+        part1 = downloads / "release.part1.rar"
+        part1.write_text("part1")
+
+        async def fake_extract_archive(start_file: str, output_dir: str, timeout_seconds: int) -> main.ExtractionResult:
+            return main.ExtractionResult(ok=True)
+
+        monkeypatch.setattr(main, "extract_archive", fake_extract_archive)
+        settings = make_settings(
+            app_download_dir=str(downloads),
+            group_state_file=str(tmp_path / "groups.json"),
+        )
+        monitor = main.GroupMonitor(settings)
+        group = main.DownloadGroup(
+            id="group-1",
+            name="release",
+            created_at=main.now_iso(),
+            updated_at=main.now_iso(),
+            original_hosts=[],
+            parts=[main.DownloadGroupPart("gid-1", "release.part1.rar", str(part1), "complete")],
+            extraction_status="extracting",
+        )
+
+        assert await monitor._maybe_extract(group) is True
+        assert group.extraction_status == "complete"
+
+    anyio.run(run_test)
+
+
 def make_settings(**overrides: Any) -> Settings:
     values = {
         "realdebrid_api_token": "token-1",
@@ -429,6 +724,10 @@ def make_settings(**overrides: Any) -> Settings:
         "aria2_max_connection_per_server": "8",
         "aria2_split": "8",
         "submitted_url_logging": False,
+        "app_download_dir": "/downloads",
+        "group_state_file": f"{tempfile.gettempdir()}/rd-downloader-test-{uuid.uuid4().hex}.json",
+        "extract_timeout_seconds": 7200,
+        "group_poll_seconds": 30,
     }
     values.update(overrides)
     return Settings(**values)

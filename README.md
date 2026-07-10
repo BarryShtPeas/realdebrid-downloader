@@ -4,7 +4,7 @@ Small self-hosted web app for submitting Real-Debrid-supported hoster links and 
 
 ## Purpose
 
-This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs. Paste a link, and the app unrestricts it through Real-Debrid and hands the direct download to an internal aria2 worker. It is a lightweight, always-on alternative to keeping a full desktop download manager running.
+This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs. Paste a single link or free text containing multiple links, and the app extracts URLs, unrestricts them through Real-Debrid, and hands the direct downloads to an internal aria2 worker. Multipart archive submissions are tracked as one group and extracted automatically after all parts complete.
 
 The runtime model is:
 
@@ -15,13 +15,17 @@ The runtime model is:
 
 ## Download Flow
 
-1. The operator submits a hoster URL.
+1. The operator submits a hoster URL or free text containing multiple hoster URLs.
 2. The app checks Real-Debrid supported hosts through `/hosts/domains` when that metadata is available.
 3. The app calls `/unrestrict/check` to check whether Real-Debrid currently has a downloadable file for that link.
 4. The app calls `/unrestrict/link` with the submitted URL.
 5. If Real-Debrid returns a generated direct download URL, the app submits it to aria2 using JSON-RPC.
 6. The web UI shows the filename, aria2 id, and generated Real-Debrid direct download URL.
 7. aria2 downloads the file to `/downloads`.
+
+When multiple URLs are pasted, the app preserves the first occurrence of each exact URL and submits each URL independently. Submitted multipart parts are stored as one group in `/config/download-groups.json` by default. The group state stores original hostnames, aria2 ids, filenames, local paths, status, and extraction state; it does not store full submitted URLs.
+
+The app polls aria2 for tracked groups every 30 seconds by default. After every part in a group reaches `complete`, it looks for a supported archive start file, preferring `.part1.rar`, then `.rar`, `.zip`, and `.7z`. Extraction runs with 7-Zip into `/downloads/<group-name>/`. Archive part files are deleted only after extraction succeeds; failed extraction leaves archive files in place and marks the group failed.
 
 If supported-host data is unavailable or inconclusive, the app still attempts the unrestrict step. When Real-Debrid cannot produce a usable download URL, the web UI shows this user-facing message:
 
@@ -62,6 +66,9 @@ Copy `.env.example` to `.env` for local development and fill in only local secre
 | `APP_DOWNLOAD_DIR` | no | `/downloads` | Container path shared with aria2. |
 | `APP_CONFIG_DIR` | no | `/config` | Persistent state/config path. |
 | `APP_SUBMITTED_URL_LOGGING` | no | `false` | Keep false unless debugging with redaction. |
+| `APP_GROUP_STATE_FILE` | no | `/config/download-groups.json` | Persistent multipart group state file. |
+| `APP_EXTRACT_TIMEOUT_SECONDS` | no | `7200` | Maximum 7-Zip extraction time per group. |
+| `APP_GROUP_POLL_SECONDS` | no | `30` | aria2 polling interval for tracked multipart groups. Set to `0` to disable the background poller. |
 | `ARIA2_RPC_URL` | yes | `http://rd-aria2:6800/jsonrpc` | Internal aria2 JSON-RPC URL. |
 | `ARIA2_RPC_SECRET` | recommended | none | aria2 RPC token. |
 | `ARIA2_DOWNLOAD_DIR` | no | `/downloads` | Directory passed to aria2. |
@@ -74,6 +81,7 @@ Open `/queue` to view and manage the internal aria2 queue. The page is server-re
 
 The queue page shows:
 
+- Multipart groups, including aggregate progress, part status, and extraction status.
 - Active downloads.
 - Waiting or paused downloads.
 - Recently stopped, completed, removed, or failed downloads.
@@ -161,7 +169,7 @@ Then open `http://localhost:8080`.
 
 ### Mapping your host download directory
 
-aria2 writes completed files to `/downloads` inside the container. Point that at any host directory with `DOWNLOAD_DIR` in `.env`:
+aria2 writes completed files to `/downloads` inside the container, and the app container also mounts that path so it can extract completed archive groups. Point that at any host directory with `DOWNLOAD_DIR` in `.env`:
 
 ```env
 DOWNLOAD_DIR=/mnt/media/downloads
@@ -183,6 +191,7 @@ To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, ngi
 
 - Never commit real Real-Debrid or GitHub tokens.
 - Never log full submitted URLs by default. The app logs only the submitted URL hostname, and the optional diagnostic flag still redacts path and query material.
+- Multipart group state stores only original hostnames and operational aria2/file metadata, not full submitted URLs.
 - Treat submitted URLs as private operator data.
 - The submit result page displays the generated Real-Debrid direct download URL in the browser UI. Protect the app route accordingly.
 - Keep aria2 JSON-RPC internal to the Docker network.
@@ -191,7 +200,7 @@ To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, ngi
 
 ## Implementation Status
 
-The production Real-Debrid and aria2 workflow is implemented in `app/main.py` with mocked tests for Real-Debrid and aria2 responses. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
+The production Real-Debrid, aria2, multipart group tracking, and automatic extraction workflow is implemented in `app/main.py` with mocked tests for Real-Debrid, aria2, persistence, and extraction responses. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
 
 ## Licence
 
