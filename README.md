@@ -16,13 +16,13 @@ The runtime model is:
 ## Download Flow
 
 1. The operator submits a hoster URL.
-2. The app may check Real-Debrid supported hosts through `/hosts/domains` or related `/hosts/*` endpoints.
-3. The app may call `/unrestrict/check` to check whether Real-Debrid currently has a downloadable file for that link.
+2. The app checks Real-Debrid supported hosts through `/hosts/domains` when that metadata is available.
+3. The app calls `/unrestrict/check` to check whether Real-Debrid currently has a downloadable file for that link.
 4. The app calls `/unrestrict/link` with the submitted URL.
 5. If Real-Debrid returns a generated direct download URL, the app submits it to aria2 using JSON-RPC.
 6. aria2 downloads the file to `/downloads`.
 
-If supported-host data is unavailable or inconclusive, the app should still attempt the unrestrict step. When Real-Debrid cannot produce a usable download URL, show this user-facing message:
+If supported-host data is unavailable or inconclusive, the app still attempts the unrestrict step. When Real-Debrid cannot produce a usable download URL, the web UI shows this user-facing message:
 
 ```text
 No download available from Real-Debrid for this link.
@@ -82,7 +82,7 @@ Run tests:
 pytest
 ```
 
-Run the placeholder app with aria2:
+Run the app with aria2:
 
 ```bash
 docker compose -f compose.example.yml up --build
@@ -139,11 +139,11 @@ Keep `JDownloader2` stopped under its existing on-demand profile as a fallback.
 ## Security
 
 - Never commit real Real-Debrid or GitHub tokens.
-- Never log full submitted URLs by default.
+- Never log full submitted URLs by default. The app logs only the submitted URL hostname, and the optional diagnostic flag still redacts path and query material.
 - Treat submitted URLs as private operator data.
 - Keep aria2 JSON-RPC internal to the Docker network.
 - Do not expose `/downloads` through the web app unless an explicit authenticated browsing feature is added later.
 
 ## Implementation Status
 
-This repository currently contains a buildable placeholder. The production Real-Debrid and aria2 workflow should be implemented on Grace Codex from this README and `AGENTS.md`, with mocked tests for Real-Debrid and aria2 responses.
+The production Real-Debrid and aria2 workflow is implemented in `app/main.py` with mocked tests for Real-Debrid and aria2 responses. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
