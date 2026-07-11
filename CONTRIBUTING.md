@@ -29,6 +29,15 @@ Development images are built by the dev container workflow:
 
 `dev` builds must never update `latest`.
 
+## Versioning
+
+The app uses `major.minor.bugfix` semantic versioning. The source of truth is `app.__version__` in `app/__init__.py`, and that value is shown in the web UI, `/api/version`, and the generated OpenAPI metadata.
+
+- Increment `major` for incompatible API or runtime behavior changes.
+- Increment `minor` for backward-compatible features.
+- Increment `bugfix` for backward-compatible fixes.
+- Release Git tags should be `vX.Y.Z` and match `app.__version__`.
+
 ## Development Workflow
 
 1. Create a feature branch from `dev`.

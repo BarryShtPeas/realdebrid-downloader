@@ -25,7 +25,9 @@ The runtime model is:
 
 When multiple URLs are pasted, the app preserves the first occurrence of each exact URL and submits each URL independently. Submitted multipart parts are stored as one group in `/config/download-groups.json` by default. The group state stores original hostnames, aria2 ids, filenames, local paths, status, and extraction state; it does not store full submitted URLs.
 
-The app polls aria2 for tracked groups every 30 seconds by default. After every part in a group reaches `complete`, it looks for a supported archive start file, preferring `.part1.rar`, then `.rar`, `.zip`, and `.7z`. Extraction runs with 7-Zip into `/downloads/<group-name>/`. Archive part files are deleted only after extraction succeeds; failed extraction leaves archive files in place and marks the group failed.
+The app polls aria2 for tracked groups every 30 seconds by default. After every part in a group reaches `complete`, it looks for a supported archive start file, preferring `.part1.rar`, then `.rar`, `.zip`, and `.7z`. Extraction runs with 7-Zip into `/downloads/<group-name>/`. Archive part files are deleted only after extraction succeeds; failed extraction leaves archive files in place and marks the group failed. Completed non-archive downloads, such as `.dmg` files, are marked `skipped` for extraction and are left in place.
+
+The queue page also opens a browser-local Server-Sent Events stream to refresh queue and multipart group progress every second by default. The stream contains only rendered queue HTML from sanitized aria2 and app metadata; it does not expose the aria2 RPC URL, aria2 RPC secret, submitted URLs, or Real-Debrid API token.
 
 If supported-host data is unavailable or inconclusive, the app still attempts the unrestrict step. When Real-Debrid cannot produce a usable download URL, the web UI shows this user-facing message:
 
@@ -69,6 +71,7 @@ Copy `.env.example` to `.env` for local development and fill in only local secre
 | `APP_GROUP_STATE_FILE` | no | `/config/download-groups.json` | Persistent multipart group state file. |
 | `APP_EXTRACT_TIMEOUT_SECONDS` | no | `7200` | Maximum 7-Zip extraction time per group. |
 | `APP_GROUP_POLL_SECONDS` | no | `30` | aria2 polling interval for tracked multipart groups. Set to `0` to disable the background poller. |
+| `APP_QUEUE_STREAM_INTERVAL_SECONDS` | no | `1` | Server-Sent Events refresh interval for the `/queue` page. |
 | `ARIA2_RPC_URL` | yes | `http://rd-aria2:6800/jsonrpc` | Internal aria2 JSON-RPC URL. |
 | `ARIA2_RPC_SECRET` | recommended | none | aria2 RPC token. |
 | `ARIA2_DOWNLOAD_DIR` | no | `/downloads` | Directory passed to aria2. |
@@ -77,7 +80,7 @@ Copy `.env.example` to `.env` for local development and fill in only local secre
 
 ## Queue Management
 
-Open `/queue` to view and manage the internal aria2 queue. The page is server-rendered and calls aria2 JSON-RPC from the app container, so the aria2 RPC endpoint and RPC secret are not exposed to the browser.
+Open `/queue` to view and manage the internal aria2 queue. The page is server-rendered for initial load and no-JavaScript fallback. When JavaScript is available, it connects to `/queue/events` with Server-Sent Events and refreshes the queue sections without a manual page reload. All aria2 JSON-RPC calls still happen from the app container, so the aria2 RPC endpoint and RPC secret are not exposed to the browser.
 
 The queue page shows:
 
@@ -92,8 +95,27 @@ Supported controls:
 - Move waiting or paused downloads to the top, up, down, or bottom.
 - Clear individual stopped history entries.
 - Clear all stopped history entries.
+- Clear eligible multipart group history entries individually.
+- Clear all eligible multipart group history entries.
 
-Queue actions redirect back to `/queue`. Refresh the page manually to update progress.
+Multipart group clearing removes only persisted app metadata from `/config/download-groups.json`; it never deletes archive files, extracted files, or `/downloads` contents. A group can be cleared only after all tracked parts are in terminal aria2 states such as `complete`, `error`, or `removed`, or after extraction is marked `complete`, `failed`, or `skipped`. Active, waiting, paused, submitted, pending, or extracting groups remain visible and cannot be cleared.
+
+Queue actions redirect back to `/queue`. Live updates resume after the redirect.
+
+## API and Swagger
+
+RDD exposes a JSON API for integrations such as browser extensions:
+
+- `GET /api/version` returns the app name and semantic version.
+- `POST /api/submit` accepts `{"url": "..."}` where the value can be one URL or free text containing multiple URLs.
+- `GET /api/queue` returns sanitized queue and multipart group state.
+- `POST /api/queue/{gid}/pause`, `/resume`, `/remove`, and `/clear` control aria2 queue entries.
+- `POST /api/queue/clear-stopped` clears aria2 stopped history.
+- `POST /api/queue/groups/{group_id}/clear` and `/api/queue/groups/clear` clear eligible multipart group metadata.
+
+Swagger UI is available at `/docs`, and the OpenAPI definition is available at `/openapi.json`. UI-only routes such as `/submit`, `/queue/events`, and redirect-based queue controls are intentionally excluded from the API schema.
+
+API responses are sanitized for clients. They include useful status, filename, progress, group, and aria2 id fields, but they do not include Real-Debrid tokens, aria2 RPC details, submitted full URLs, generated direct Real-Debrid URLs, or local download paths.
 
 ## Local Development
 
@@ -129,6 +151,8 @@ Production tags:
 - `latest` from the default branch.
 - Branch/SHA tags for traceable builds.
 - Release tag names when a Git tag is pushed.
+
+The app version uses `major.minor.bugfix` semantic versioning and is defined in `app/__init__.py`. Release tags should use `vX.Y.Z` and match the app version displayed in the web UI and `/api/version`.
 
 Development tags are published by the `Build and publish dev container`
 GitHub Actions workflow when changes are pushed to `dev`, or when the workflow is

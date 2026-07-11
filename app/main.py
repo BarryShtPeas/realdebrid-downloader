@@ -8,7 +8,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -16,11 +16,17 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, Form, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+
+from app import __version__
 
 
 NO_DOWNLOAD_MESSAGE = "No download available from Real-Debrid for this link."
+GROUP_TERMINAL_PART_STATUSES = {"complete", "error", "removed"}
+GROUP_TERMINAL_EXTRACTION_STATUSES = {"complete", "failed", "skipped"}
+NO_SUPPORTED_ARCHIVE_MESSAGE = "Could not find a supported archive start file."
 
 logger = logging.getLogger("rd_downloader")
 
@@ -41,7 +47,93 @@ async def lifespan(fastapi_app: FastAPI) -> Any:
                 await task
 
 
-app = FastAPI(title="Real-Debrid Downloader", lifespan=lifespan)
+APP_NAME = "Real-Debrid Downloader"
+
+
+app = FastAPI(
+    title=APP_NAME,
+    version=__version__,
+    description="Self-hosted API and web UI for submitting Real-Debrid downloads to aria2.",
+    lifespan=lifespan,
+)
+
+
+class ApiSubmitRequest(BaseModel):
+    url: str = Field(..., min_length=1, description="One URL or free text containing one or more URLs.")
+
+
+class ApiDownloadResult(BaseModel):
+    ok: bool
+    message: str
+    aria2_gid: Optional[str] = None
+    filename: Optional[str] = None
+    host_supported: Optional[bool] = None
+    group_id: Optional[str] = None
+    submitted_hostname: Optional[str] = None
+
+
+class ApiGroupPart(BaseModel):
+    aria2_gid: str
+    filename: Optional[str] = None
+    status: str
+    total_length: int
+    completed_length: int
+    progress_percent: float
+
+
+class ApiGroupResult(BaseModel):
+    id: str
+    name: str
+    original_hosts: list[str]
+    extraction_status: str
+    progress_percent: float
+    complete_parts: int
+    total_parts: int
+    parts: list[ApiGroupPart]
+
+
+class ApiSubmitResponse(BaseModel):
+    ok: bool
+    message: str
+    downloads: list[ApiDownloadResult]
+    group: Optional[ApiGroupResult] = None
+
+
+class ApiQueueItem(BaseModel):
+    gid: str
+    status: str
+    name: str
+    total_length: int
+    completed_length: int
+    download_speed: int
+    eta_seconds: Optional[int]
+    progress_percent: float
+    can_pause: bool
+    can_resume: bool
+    can_remove: bool
+    can_reorder: bool
+    can_clear: bool
+
+
+class ApiQueueResponse(BaseModel):
+    active: list[ApiQueueItem]
+    waiting: list[ApiQueueItem]
+    stopped: list[ApiQueueItem]
+    groups: list[ApiGroupResult]
+
+
+class ApiMessageResponse(BaseModel):
+    ok: bool
+    message: str
+
+
+class ApiVersionResponse(BaseModel):
+    name: str
+    version: str
+
+
+class HealthResponse(BaseModel):
+    status: str
 
 
 @dataclass(frozen=True)
@@ -58,6 +150,7 @@ class Settings:
     group_state_file: str
     extract_timeout_seconds: int
     group_poll_seconds: int
+    queue_stream_interval_seconds: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -85,6 +178,7 @@ class Settings:
             ),
             extract_timeout_seconds=parse_env_int("APP_EXTRACT_TIMEOUT_SECONDS", 7200),
             group_poll_seconds=parse_env_int("APP_GROUP_POLL_SECONDS", 30),
+            queue_stream_interval_seconds=parse_env_float("APP_QUEUE_STREAM_INTERVAL_SECONDS", 1.0),
         )
 
 
@@ -228,6 +322,27 @@ class GroupStateStore:
             groups.append(group)
         self.save_groups(groups)
 
+    def remove_group(self, group_id: str) -> bool:
+        groups = self.load_groups()
+        retained: list[DownloadGroup] = []
+        removed = False
+        for group in groups:
+            if group.id == group_id and is_group_clearable(group):
+                removed = True
+                continue
+            retained.append(group)
+        if removed:
+            self.save_groups(retained)
+        return removed
+
+    def clear_eligible_groups(self) -> int:
+        groups = self.load_groups()
+        retained = [group for group in groups if not is_group_clearable(group)]
+        removed_count = len(groups) - len(retained)
+        if removed_count:
+            self.save_groups(retained)
+        return removed_count
+
 
 def parse_download_group(payload: dict[str, Any]) -> DownloadGroup | None:
     group_id = payload.get("id")
@@ -272,6 +387,19 @@ def parse_download_group(payload: dict[str, Any]) -> DownloadGroup | None:
     extraction_status = payload.get("extraction_status")
     extraction_error = payload.get("extraction_error")
     extraction_output_path = payload.get("extraction_output_path")
+    if (
+        extraction_status == "failed"
+        and extraction_error == NO_SUPPORTED_ARCHIVE_MESSAGE
+        and select_archive_start_file(
+            [
+                part.local_download_path or part.filename or ""
+                for part in parts
+            ],
+        )
+        is None
+    ):
+        extraction_status = "skipped"
+        extraction_error = None
     return DownloadGroup(
         id=group_id,
         name=safe_group_name(name, fallback=f"download-group-{group_id[:8]}"),
@@ -280,7 +408,7 @@ def parse_download_group(payload: dict[str, Any]) -> DownloadGroup | None:
         original_hosts=hosts,
         parts=parts,
         extraction_status=extraction_status
-        if extraction_status in {"pending", "extracting", "complete", "failed"}
+        if extraction_status in {"pending", "extracting", "complete", "failed", "skipped"}
         else "pending",
         extraction_error=extraction_error if isinstance(extraction_error, str) and extraction_error else None,
         extraction_output_path=extraction_output_path
@@ -355,6 +483,13 @@ def local_download_path(download_dir: str, filename: str | None) -> str | None:
 def parse_env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def parse_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
     except ValueError:
         return default
 
@@ -840,8 +975,9 @@ class GroupMonitor:
         archive_paths = [part.local_download_path for part in group.parts if part.local_download_path]
         start_file = select_archive_start_file(archive_paths)
         if start_file is None:
-            group.extraction_status = "failed"
-            group.extraction_error = "Could not find a supported archive start file."
+            group.extraction_status = "skipped"
+            group.extraction_error = None
+            group.extraction_output_path = None
             return True
 
         output_dir = os.path.join(self.settings.app_download_dir, safe_group_name(group.name))
@@ -934,9 +1070,221 @@ def get_group_store() -> GroupStateStore:
     return GroupStateStore(Settings.from_env().group_state_file)
 
 
-@app.get("/healthz")
-async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+@app.get("/healthz", response_model=HealthResponse, tags=["system"])
+async def healthz() -> HealthResponse:
+    return HealthResponse(status="ok")
+
+
+@app.get("/api/version", response_model=ApiVersionResponse, tags=["system"])
+async def api_version() -> ApiVersionResponse:
+    return ApiVersionResponse(name=APP_NAME, version=__version__)
+
+
+@app.post("/api/submit", response_model=ApiSubmitResponse, tags=["downloads"])
+async def api_submit(
+    payload: ApiSubmitRequest,
+    downloader: Downloader = Depends(get_downloader),
+) -> ApiSubmitResponse:
+    result = await submit_download_text(payload.url, downloader)
+    return api_submit_response(result)
+
+
+@app.get("/api/queue", response_model=ApiQueueResponse, tags=["queue"])
+async def api_queue(
+    aria2: Aria2Client = Depends(get_aria2_client),
+    group_store: GroupStateStore = Depends(get_group_store),
+) -> ApiQueueResponse:
+    try:
+        snapshot = await aria2.queue_snapshot()
+    except UpstreamError as exc:
+        logger.warning("aria2 queue API read failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Download queue is temporarily unavailable.",
+        ) from exc
+    groups = project_groups_for_display(group_store.load_groups(), snapshot)
+    return api_queue_response(snapshot, groups)
+
+
+@app.post("/api/queue/clear-stopped", response_model=ApiMessageResponse, tags=["queue"])
+async def api_queue_clear_stopped(
+    aria2: Aria2Client = Depends(get_aria2_client),
+) -> ApiMessageResponse:
+    return await run_api_queue_action(aria2.purge_download_result(), "Stopped history cleared.")
+
+
+@app.post("/api/queue/groups/clear", response_model=ApiMessageResponse, tags=["multipart groups"])
+async def api_queue_clear_groups(
+    group_store: GroupStateStore = Depends(get_group_store),
+) -> ApiMessageResponse:
+    removed_count = group_store.clear_eligible_groups()
+    if removed_count == 1:
+        return ApiMessageResponse(ok=True, message="Cleared 1 multipart group history entry.")
+    if removed_count > 1:
+        return ApiMessageResponse(ok=True, message=f"Cleared {removed_count} multipart group history entries.")
+    return ApiMessageResponse(ok=False, message="No completed multipart group history to clear.")
+
+
+@app.post("/api/queue/groups/{group_id}/clear", response_model=ApiMessageResponse, tags=["multipart groups"])
+async def api_queue_clear_group(
+    group_id: str,
+    group_store: GroupStateStore = Depends(get_group_store),
+) -> ApiMessageResponse:
+    if group_store.remove_group(group_id):
+        return ApiMessageResponse(ok=True, message="Multipart group history entry cleared.")
+    return ApiMessageResponse(ok=False, message="Multipart group is still active or was not found.")
+
+
+@app.post("/api/queue/{gid}/pause", response_model=ApiMessageResponse, tags=["queue"])
+async def api_queue_pause(
+    gid: str,
+    aria2: Aria2Client = Depends(get_aria2_client),
+) -> ApiMessageResponse:
+    return await run_api_queue_action(aria2.pause(gid), "Download paused.")
+
+
+@app.post("/api/queue/{gid}/resume", response_model=ApiMessageResponse, tags=["queue"])
+async def api_queue_resume(
+    gid: str,
+    aria2: Aria2Client = Depends(get_aria2_client),
+) -> ApiMessageResponse:
+    return await run_api_queue_action(aria2.unpause(gid), "Download resumed.")
+
+
+@app.post("/api/queue/{gid}/remove", response_model=ApiMessageResponse, tags=["queue"])
+async def api_queue_remove(
+    gid: str,
+    aria2: Aria2Client = Depends(get_aria2_client),
+) -> ApiMessageResponse:
+    return await run_api_queue_action(aria2.remove(gid), "Download removed from queue.")
+
+
+@app.post("/api/queue/{gid}/clear", response_model=ApiMessageResponse, tags=["queue"])
+async def api_queue_clear(
+    gid: str,
+    aria2: Aria2Client = Depends(get_aria2_client),
+) -> ApiMessageResponse:
+    return await run_api_queue_action(aria2.remove_download_result(gid), "History entry cleared.")
+
+
+async def run_api_queue_action(action: Any, success_message: str) -> ApiMessageResponse:
+    try:
+        await action
+    except (UpstreamError, ValueError) as exc:
+        logger.warning("aria2 queue API action failed: %s", exc)
+        return ApiMessageResponse(ok=False, message="Queue action failed. Please try again.")
+    return ApiMessageResponse(ok=True, message=success_message)
+
+
+async def submit_download_text(submitted_text: str, downloader: Any) -> SubmissionResult:
+    try:
+        if hasattr(downloader, "submit_text"):
+            return await downloader.submit_text(submitted_text)
+        result = await downloader.submit(submitted_text)
+        return SubmissionResult(ok=result.ok, message=result.message, downloads=[result])
+    except ConfigurationError as exc:
+        logger.warning("Downloader configuration error: %s", exc)
+        return SubmissionResult(ok=False, message=str(exc), downloads=[])
+    except UpstreamError as exc:
+        logger.warning("Downloader upstream error: %s", exc)
+        return SubmissionResult(
+            ok=False,
+            message="Download service is temporarily unavailable. Please try again later.",
+            downloads=[],
+        )
+    except DownloadUnavailableError:
+        return SubmissionResult(ok=False, message=NO_DOWNLOAD_MESSAGE, downloads=[])
+
+
+def api_submit_response(result: SubmissionResult) -> ApiSubmitResponse:
+    return ApiSubmitResponse(
+        ok=result.ok,
+        message=result.message,
+        downloads=[api_download_result(download) for download in result.downloads],
+        group=api_group_result(result.group) if result.group else None,
+    )
+
+
+def api_download_result(download: DownloadResult) -> ApiDownloadResult:
+    return ApiDownloadResult(
+        ok=download.ok,
+        message=download.message,
+        aria2_gid=download.aria2_gid,
+        filename=download.filename,
+        host_supported=download.host_supported,
+        group_id=download.group_id,
+        submitted_hostname=download.submitted_hostname,
+    )
+
+
+def api_queue_response(snapshot: QueueSnapshot, groups: list[DownloadGroup]) -> ApiQueueResponse:
+    return ApiQueueResponse(
+        active=[api_queue_item(item) for item in snapshot.active],
+        waiting=[api_queue_item(item) for item in snapshot.waiting],
+        stopped=[api_queue_item(item) for item in snapshot.stopped],
+        groups=[api_group_result(group) for group in groups],
+    )
+
+
+def api_queue_item(item: QueueItem) -> ApiQueueItem:
+    return ApiQueueItem(
+        gid=item.gid,
+        status=item.status,
+        name=item.name,
+        total_length=item.total_length,
+        completed_length=item.completed_length,
+        download_speed=item.download_speed,
+        eta_seconds=item.eta_seconds,
+        progress_percent=item.progress_percent,
+        can_pause=item.can_pause,
+        can_resume=item.can_resume,
+        can_remove=item.can_remove,
+        can_reorder=item.can_reorder,
+        can_clear=item.can_clear,
+    )
+
+
+def api_group_result(group: DownloadGroup) -> ApiGroupResult:
+    return ApiGroupResult(
+        id=group.id,
+        name=group.name,
+        original_hosts=group.original_hosts,
+        extraction_status=group.extraction_status,
+        progress_percent=group.progress_percent,
+        complete_parts=group.complete_parts,
+        total_parts=len(group.parts),
+        parts=[api_group_part(part) for part in group.parts],
+    )
+
+
+def api_group_part(part: DownloadGroupPart) -> ApiGroupPart:
+    total_length = part.total_length
+    completed_length = part.completed_length
+    progress = min(100.0, (completed_length / total_length) * 100) if total_length > 0 else 0.0
+    if total_length <= 0 and part.status == "complete":
+        progress = 100.0
+    return ApiGroupPart(
+        aria2_gid=part.aria2_gid,
+        filename=part.filename,
+        status=part.status,
+        total_length=total_length,
+        completed_length=completed_length,
+        progress_percent=progress,
+    )
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def index() -> str:
+    return render_page()
+
+
+@app.post("/submit", response_class=HTMLResponse, include_in_schema=False)
+async def submit(
+    url: str = Form(...),
+    downloader: Downloader = Depends(get_downloader),
+) -> str:
+    result = await submit_download_text(url, downloader)
+    return render_page(result)
 
 
 async def group_monitor_loop(settings: Settings) -> None:
@@ -949,37 +1297,7 @@ async def group_monitor_loop(settings: Settings) -> None:
         await asyncio.sleep(settings.group_poll_seconds)
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    return render_page()
-
-
-@app.post("/submit", response_class=HTMLResponse)
-async def submit(
-    url: str = Form(...),
-    downloader: Downloader = Depends(get_downloader),
-) -> str:
-    try:
-        if hasattr(downloader, "submit_text"):
-            result = await downloader.submit_text(url)
-        else:
-            result = await downloader.submit(url)
-    except ConfigurationError as exc:
-        logger.warning("Downloader configuration error: %s", exc)
-        result = DownloadResult(ok=False, message=str(exc))
-    except UpstreamError as exc:
-        logger.warning("Downloader upstream error: %s", exc)
-        result = DownloadResult(
-            ok=False,
-            message="Download service is temporarily unavailable. Please try again later.",
-        )
-    except DownloadUnavailableError:
-        result = DownloadResult(ok=False, message=NO_DOWNLOAD_MESSAGE)
-
-    return render_page(result)
-
-
-@app.get("/queue", response_class=HTMLResponse)
+@app.get("/queue", response_class=HTMLResponse, include_in_schema=False)
 async def queue(
     message: Optional[str] = Query(None),
     level: str = Query("success"),
@@ -988,7 +1306,7 @@ async def queue(
 ) -> str:
     try:
         snapshot = await aria2.queue_snapshot()
-        groups = group_store.load_groups()
+        groups = project_groups_for_display(group_store.load_groups(), snapshot)
         return render_queue_page(snapshot, groups=groups, message=message, level=level)
     except UpstreamError as exc:
         logger.warning("aria2 queue read failed: %s", exc)
@@ -1000,7 +1318,53 @@ async def queue(
         )
 
 
-@app.post("/queue/{gid}/pause")
+@app.get("/queue/events", include_in_schema=False)
+async def queue_events(
+    request: Request,
+    once: bool = Query(False, include_in_schema=False),
+    aria2: Aria2Client = Depends(get_aria2_client),
+    group_store: GroupStateStore = Depends(get_group_store),
+) -> StreamingResponse:
+    interval = Settings.from_env().queue_stream_interval_seconds
+    return StreamingResponse(
+        queue_event_stream(
+            request=request,
+            aria2=aria2,
+            group_store=group_store,
+            interval_seconds=interval,
+            once=once,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/queue/groups/clear", include_in_schema=False)
+async def queue_clear_groups(
+    group_store: GroupStateStore = Depends(get_group_store),
+) -> RedirectResponse:
+    removed_count = group_store.clear_eligible_groups()
+    if removed_count == 1:
+        return queue_redirect("Cleared 1 multipart group history entry.", "success")
+    if removed_count > 1:
+        return queue_redirect(f"Cleared {removed_count} multipart group history entries.", "success")
+    return queue_redirect("No completed multipart group history to clear.", "error")
+
+
+@app.post("/queue/groups/{group_id}/clear", include_in_schema=False)
+async def queue_clear_group(
+    group_id: str,
+    group_store: GroupStateStore = Depends(get_group_store),
+) -> RedirectResponse:
+    if group_store.remove_group(group_id):
+        return queue_redirect("Multipart group history entry cleared.", "success")
+    return queue_redirect("Multipart group is still active or was not found.", "error")
+
+
+@app.post("/queue/{gid}/pause", include_in_schema=False)
 async def queue_pause(
     gid: str,
     aria2: Aria2Client = Depends(get_aria2_client),
@@ -1008,7 +1372,7 @@ async def queue_pause(
     return await run_queue_action(aria2.pause(gid), "Download paused.")
 
 
-@app.post("/queue/{gid}/resume")
+@app.post("/queue/{gid}/resume", include_in_schema=False)
 async def queue_resume(
     gid: str,
     aria2: Aria2Client = Depends(get_aria2_client),
@@ -1016,7 +1380,7 @@ async def queue_resume(
     return await run_queue_action(aria2.unpause(gid), "Download resumed.")
 
 
-@app.post("/queue/{gid}/remove")
+@app.post("/queue/{gid}/remove", include_in_schema=False)
 async def queue_remove(
     gid: str,
     aria2: Aria2Client = Depends(get_aria2_client),
@@ -1024,7 +1388,7 @@ async def queue_remove(
     return await run_queue_action(aria2.remove(gid), "Download removed from queue.")
 
 
-@app.post("/queue/{gid}/clear")
+@app.post("/queue/{gid}/clear", include_in_schema=False)
 async def queue_clear(
     gid: str,
     aria2: Aria2Client = Depends(get_aria2_client),
@@ -1032,14 +1396,14 @@ async def queue_clear(
     return await run_queue_action(aria2.remove_download_result(gid), "History entry cleared.")
 
 
-@app.post("/queue/clear-stopped")
+@app.post("/queue/clear-stopped", include_in_schema=False)
 async def queue_clear_stopped(
     aria2: Aria2Client = Depends(get_aria2_client),
 ) -> RedirectResponse:
     return await run_queue_action(aria2.purge_download_result(), "Stopped history cleared.")
 
 
-@app.post("/queue/{gid}/move")
+@app.post("/queue/{gid}/move", include_in_schema=False)
 async def queue_move(
     gid: str,
     direction: str = Form(...),
@@ -1064,6 +1428,36 @@ async def run_queue_action(action: Any, success_message: str) -> RedirectRespons
 def queue_redirect(message: str, level: str) -> RedirectResponse:
     query = urlencode({"message": message, "level": level})
     return RedirectResponse(f"/queue?{query}", status_code=303)
+
+
+async def queue_event_stream(
+    request: Request,
+    aria2: Aria2Client,
+    group_store: GroupStateStore,
+    interval_seconds: float,
+    once: bool = False,
+) -> Any:
+    interval = max(interval_seconds, 0.1)
+    while True:
+        if await request.is_disconnected():
+            break
+        try:
+            snapshot = await aria2.queue_snapshot()
+            groups = project_groups_for_display(group_store.load_groups(), snapshot)
+            yield format_sse("queue", {"html": render_queue_sections(snapshot, groups)})
+        except Exception as exc:
+            logger.warning("aria2 queue event read failed: %s", exc)
+            yield format_sse(
+                "error",
+                {"message": "Download queue is temporarily unavailable."},
+            )
+        if once:
+            break
+        await asyncio.sleep(interval)
+
+
+def format_sse(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
 
 def render_page(result: DownloadResult | SubmissionResult | None = None) -> str:
@@ -1227,6 +1621,11 @@ def render_page(result: DownloadResult | SubmissionResult | None = None) -> str:
             background: var(--error-bg);
             color: var(--error-fg);
           }}
+          .app-version {{
+            color: var(--muted);
+            font-size: .9rem;
+            margin-top: 1.25rem;
+          }}
         </style>
       </head>
       <body>
@@ -1245,6 +1644,7 @@ def render_page(result: DownloadResult | SubmissionResult | None = None) -> str:
             </label>
             <button type="submit">Submit to aria2</button>
           </form>
+          <p class="app-version">v{html.escape(__version__)}</p>
         </main>
       </body>
     </html>
@@ -1266,21 +1666,7 @@ def render_queue_page(
             "</section>"
         )
 
-    sections = ""
-    if snapshot is not None:
-        sections = "\n".join(
-            [
-                render_group_section(groups or []),
-                render_queue_section("Active", snapshot.active, "No active downloads."),
-                render_queue_section("Waiting", snapshot.waiting, "No waiting downloads."),
-                render_queue_section(
-                    "Stopped",
-                    snapshot.stopped,
-                    "No completed, removed, or failed downloads.",
-                    include_clear_all=True,
-                ),
-            ],
-        )
+    sections = render_queue_sections(snapshot, groups or [])
 
     return f"""
     <!doctype html>
@@ -1444,6 +1830,11 @@ def render_queue_page(
             background: var(--error-bg);
             color: var(--error-fg);
           }}
+          .app-version {{
+            color: var(--muted);
+            font-size: .9rem;
+            margin-top: 1.25rem;
+          }}
         </style>
       </head>
       <body>
@@ -1454,16 +1845,99 @@ def render_queue_page(
           </nav>
           <h1>Download Queue</h1>
           <p>Manage active, waiting, and recently stopped aria2 downloads and multipart extraction groups.</p>
+          <p class="live-status" id="queue-live-status" aria-live="polite">Live updates connecting...</p>
           {message_html}
-          {sections}
+          <div id="queue-sections">
+            {sections}
+          </div>
+          <p class="app-version">v{html.escape(__version__)}</p>
         </main>
+        <script>
+          (() => {{
+            const container = document.getElementById("queue-sections");
+            const status = document.getElementById("queue-live-status");
+            if (!container || !status) {{
+              return;
+            }}
+            if (!("EventSource" in window)) {{
+              status.textContent = "Live updates unavailable";
+              return;
+            }}
+
+            const source = new EventSource("/queue/events");
+            source.addEventListener("open", () => {{
+              status.textContent = "Live updates active";
+            }});
+            source.addEventListener("queue", (event) => {{
+              try {{
+                const payload = JSON.parse(event.data);
+                if (typeof payload.html === "string") {{
+                  container.innerHTML = payload.html;
+                  status.textContent = "Live updates active";
+                }}
+              }} catch (_error) {{
+                status.textContent = "Live updates unavailable";
+              }}
+            }});
+            source.addEventListener("error", (event) => {{
+              let message = "Live updates reconnecting...";
+              if ("data" in event && event.data) {{
+                try {{
+                  const payload = JSON.parse(event.data);
+                  if (typeof payload.message === "string") {{
+                    message = payload.message;
+                  }}
+                }} catch (_error) {{
+                  message = "Live updates unavailable";
+                }}
+              }}
+              status.textContent = source.readyState === EventSource.CLOSED
+                ? "Live updates unavailable"
+                : message;
+            }});
+          }})();
+        </script>
       </body>
     </html>
     """
 
 
+def render_queue_sections(
+    snapshot: QueueSnapshot | None,
+    groups: list[DownloadGroup],
+) -> str:
+    sections: list[str] = [render_group_section(groups)]
+    if snapshot is None:
+        return "\n".join(sections)
+    sections.extend(
+        [
+            render_queue_section("Active", snapshot.active, "No active downloads."),
+            render_queue_section("Waiting", snapshot.waiting, "No waiting downloads."),
+            render_queue_section(
+                "Stopped",
+                snapshot.stopped,
+                "No completed, removed, or failed downloads.",
+                include_clear_all=True,
+            ),
+        ],
+    )
+    return "\n".join(sections)
+
+
 def render_group_section(groups: list[DownloadGroup]) -> str:
-    heading = "<h2>Multipart Groups</h2>"
+    clear_all_html = ""
+    if any(is_group_clearable(group) for group in groups):
+        clear_all_html = (
+            '<form method="post" action="/queue/groups/clear">'
+            '<button class="danger" type="submit">Clear multipart history</button>'
+            "</form>"
+        )
+    heading = (
+        '<div class="section-heading">'
+        "<h2>Multipart Groups</h2>"
+        f"{clear_all_html}"
+        "</div>"
+    )
     if not groups:
         return f"{heading}<p>No multipart groups yet.</p>"
     newest_first = sorted(groups, key=lambda group: group.created_at, reverse=True)
@@ -1499,6 +1973,14 @@ def render_group_item(group: DownloadGroup) -> str:
 
     meta_html = "".join(f"<span>{entry}</span>" for entry in meta)
     parts_html = "".join(part_rows)
+    actions_html = ""
+    if is_group_clearable(group):
+        group_id = html.escape(group.id, quote=True)
+        actions_html = (
+            '<div class="actions">'
+            f'{queue_button(f"/queue/groups/{group_id}/clear", "Clear", danger=True)}'
+            "</div>"
+        )
     return (
         '<article class="item">'
         f"<h3>{html.escape(group.name)}</h3>"
@@ -1507,8 +1989,48 @@ def render_group_item(group: DownloadGroup) -> str:
         f'<span style="width: {progress}%"></span>'
         "</div>"
         f'<div class="parts">{parts_html}</div>'
+        f"{actions_html}"
         "</article>"
     )
+
+
+def project_groups_for_display(
+    groups: list[DownloadGroup],
+    snapshot: QueueSnapshot,
+) -> list[DownloadGroup]:
+    items_by_gid = {
+        item.gid: item
+        for item in [*snapshot.active, *snapshot.waiting, *snapshot.stopped]
+        if item.gid
+    }
+    projected_groups: list[DownloadGroup] = []
+    for group in groups:
+        projected_parts: list[DownloadGroupPart] = []
+        changed = False
+        for part in group.parts:
+            item = items_by_gid.get(part.aria2_gid)
+            if item is None:
+                projected_parts.append(replace(part))
+                continue
+            projected_parts.append(
+                replace(
+                    part,
+                    filename=item.name or part.filename,
+                    status=item.status,
+                    error=item.error_message,
+                    total_length=item.total_length,
+                    completed_length=item.completed_length,
+                ),
+            )
+            changed = True
+        projected_groups.append(replace(group, parts=projected_parts) if changed else replace(group))
+    return projected_groups
+
+
+def is_group_clearable(group: DownloadGroup) -> bool:
+    if group.extraction_status in GROUP_TERMINAL_EXTRACTION_STATUSES:
+        return True
+    return bool(group.parts) and all(part.status in GROUP_TERMINAL_PART_STATUSES for part in group.parts)
 
 
 def render_queue_section(

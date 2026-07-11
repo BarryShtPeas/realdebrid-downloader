@@ -11,3 +11,4 @@ htmlcov/
 .DS_Store
 dist/
 build/
+AGENTS.local.md

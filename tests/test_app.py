@@ -42,6 +42,44 @@ def test_healthz() -> None:
     anyio.run(run_test)
 
 
+def test_swagger_openapi_documents_rdd_api_only() -> None:
+    async def run_test() -> None:
+        async with app_client() as client:
+            response = await client.get("/openapi.json")
+            docs_response = await client.get("/docs")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["info"]["title"] == "Real-Debrid Downloader"
+        assert payload["info"]["version"] == main.__version__
+        assert "/api/version" in payload["paths"]
+        assert "/api/submit" in payload["paths"]
+        assert "/api/queue" in payload["paths"]
+        assert "/submit" not in payload["paths"]
+        assert "/queue/events" not in payload["paths"]
+        assert "/queue/{gid}/pause" not in payload["paths"]
+        assert docs_response.status_code == 200
+        assert "Swagger UI" in docs_response.text
+
+    anyio.run(run_test)
+
+
+def test_api_version_and_pages_include_app_version() -> None:
+    async def run_test() -> None:
+        async with app_client() as client:
+            version_response = await client.get("/api/version")
+            page_response = await client.get("/")
+
+        assert version_response.status_code == 200
+        assert version_response.json() == {
+            "name": "Real-Debrid Downloader",
+            "version": main.__version__,
+        }
+        assert f"v{main.__version__}" in page_response.text
+
+    anyio.run(run_test)
+
+
 def test_submit_success_does_not_echo_submitted_url() -> None:
     submitted_url = "https://rapidgator.example/private/file?token=secret"
 
@@ -66,6 +104,65 @@ def test_submit_success_does_not_echo_submitted_url() -> None:
         assert "https://download.example/release.iso?rd=direct" in response_text
         assert submitted_url not in response_text
         assert "token=secret" not in response_text
+
+    anyio.run(run_test)
+
+
+def test_api_submit_returns_sanitized_json() -> None:
+    submitted_text = "https://rapidgator.example/private/file?token=secret"
+
+    class FakeDownloader:
+        async def submit_text(self, text: str) -> main.SubmissionResult:
+            assert text == submitted_text
+            download = DownloadResult(
+                ok=True,
+                message="Download submitted to aria2.",
+                aria2_gid="abc123",
+                filename="release.iso",
+                direct_url="https://download.example/release.iso?rd=direct",
+                host_supported=True,
+                group_id="group-1",
+                local_path="/downloads/release.iso",
+                submitted_hostname="rapidgator.example",
+            )
+            return main.SubmissionResult(
+                ok=True,
+                message="Download submitted to aria2.",
+                downloads=[download],
+                group=main.DownloadGroup(
+                    id="group-1",
+                    name="release",
+                    created_at=main.now_iso(),
+                    updated_at=main.now_iso(),
+                    original_hosts=["rapidgator.example"],
+                    parts=[
+                        main.DownloadGroupPart(
+                            "abc123",
+                            "release.iso",
+                            "/downloads/release.iso",
+                            "submitted",
+                        ),
+                    ],
+                ),
+            )
+
+    async def run_test() -> None:
+        app.dependency_overrides[get_downloader] = lambda: FakeDownloader()
+        async with app_client() as client:
+            response = await client.post("/api/submit", json={"url": submitted_text})
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        assert payload["downloads"][0]["aria2_gid"] == "abc123"
+        assert payload["downloads"][0]["filename"] == "release.iso"
+        assert payload["downloads"][0]["submitted_hostname"] == "rapidgator.example"
+        assert payload["group"]["id"] == "group-1"
+        response_text = response.text
+        assert submitted_text not in response_text
+        assert "token=secret" not in response_text
+        assert "download.example" not in response_text
+        assert "/downloads/release.iso" not in response_text
 
     anyio.run(run_test)
 
@@ -351,6 +448,114 @@ def test_queue_page_renders_downloads_and_controls() -> None:
         assert '/queue/waiting-1/move' in text
         assert '/queue/stopped-1/clear' in text
         assert '/queue/clear-stopped' in text
+        assert f"v{main.__version__}" in text
+
+    anyio.run(run_test)
+
+
+def test_api_queue_returns_sanitized_queue_and_group_state() -> None:
+    active = QueueItem(
+        gid="active-1",
+        status="active",
+        name="active.iso",
+        total_length=1000,
+        completed_length=500,
+        download_speed=100,
+        eta_seconds=5,
+        error_message="https://secret.example/private?token=bad",
+        can_pause=True,
+        can_resume=False,
+        can_remove=True,
+        can_reorder=False,
+        can_clear=False,
+    )
+    group = main.DownloadGroup(
+        id="group-1",
+        name="release",
+        created_at=main.now_iso(),
+        updated_at=main.now_iso(),
+        original_hosts=["rapidgator.example"],
+        parts=[
+            main.DownloadGroupPart(
+                aria2_gid="active-1",
+                filename="release.iso",
+                local_download_path="/downloads/release.iso",
+                status="submitted",
+                error="https://secret.example/private?token=bad",
+                total_length=0,
+                completed_length=0,
+            ),
+        ],
+    )
+
+    class FakeAria2:
+        async def queue_snapshot(self) -> QueueSnapshot:
+            return QueueSnapshot(active=[active], waiting=[], stopped=[])
+
+    class FakeGroupStore:
+        def load_groups(self) -> list[main.DownloadGroup]:
+            return [group]
+
+    async def run_test() -> None:
+        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        app.dependency_overrides[main.get_group_store] = lambda: FakeGroupStore()
+        async with app_client() as client:
+            response = await client.get("/api/queue")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["active"][0]["gid"] == "active-1"
+        assert payload["active"][0]["progress_percent"] == 50.0
+        assert payload["groups"][0]["id"] == "group-1"
+        assert payload["groups"][0]["parts"][0]["status"] == "active"
+        assert payload["groups"][0]["parts"][0]["progress_percent"] == 50.0
+        response_text = response.text
+        assert "secret.example" not in response_text
+        assert "token=bad" not in response_text
+        assert "/downloads/release.iso" not in response_text
+
+    anyio.run(run_test)
+
+
+def test_api_queue_action_routes_call_aria2() -> None:
+    calls: list[str] = []
+
+    class FakeAria2:
+        async def pause(self, gid: str) -> None:
+            calls.append(f"pause:{gid}")
+
+        async def unpause(self, gid: str) -> None:
+            calls.append(f"unpause:{gid}")
+
+        async def remove(self, gid: str) -> None:
+            calls.append(f"remove:{gid}")
+
+        async def remove_download_result(self, gid: str) -> None:
+            calls.append(f"clear:{gid}")
+
+        async def purge_download_result(self) -> None:
+            calls.append("purge")
+
+    async def run_test() -> None:
+        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        async with app_client() as client:
+            responses = [
+                await client.post("/api/queue/gid-1/pause"),
+                await client.post("/api/queue/gid-1/resume"),
+                await client.post("/api/queue/gid-1/remove"),
+                await client.post("/api/queue/gid-1/clear"),
+                await client.post("/api/queue/clear-stopped"),
+            ]
+
+        assert all(response.status_code == 200 for response in responses)
+        assert all(response.json()["ok"] is True for response in responses)
+        assert calls == [
+            "pause:gid-1",
+            "unpause:gid-1",
+            "remove:gid-1",
+            "clear:gid-1",
+            "purge",
+        ]
 
     anyio.run(run_test)
 
@@ -417,6 +622,259 @@ def test_queue_page_handles_aria2_failure_without_leaking_secret() -> None:
         assert "Download queue is temporarily unavailable." in response.text
         assert "aria-secret" not in response.text
         assert "aria2.test" not in response.text
+
+    anyio.run(run_test)
+
+
+def test_queue_events_emits_live_queue_html() -> None:
+    active = QueueItem(
+        gid="active-1",
+        status="active",
+        name="live.iso",
+        total_length=1000,
+        completed_length=250,
+        download_speed=100,
+        eta_seconds=7,
+        error_message=None,
+        can_pause=True,
+        can_resume=False,
+        can_remove=True,
+        can_reorder=False,
+        can_clear=False,
+    )
+
+    class FakeAria2:
+        async def queue_snapshot(self) -> QueueSnapshot:
+            return QueueSnapshot(active=[active], waiting=[], stopped=[])
+
+    async def run_test() -> None:
+        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        async with app_client() as client:
+            response = await client.get("/queue/events?once=true")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert "event: queue" in response.text
+        assert "live.iso" in response.text
+        assert "25.0%" in response.text
+
+    anyio.run(run_test)
+
+
+def test_queue_events_error_does_not_leak_aria2_secret_or_url() -> None:
+    class FakeAria2:
+        async def queue_snapshot(self) -> QueueSnapshot:
+            raise main.UpstreamError("token:aria-secret failed at https://aria2.test/jsonrpc")
+
+    async def run_test() -> None:
+        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        async with app_client() as client:
+            response = await client.get("/queue/events?once=true")
+
+        assert response.status_code == 200
+        assert "event: error" in response.text
+        assert "Download queue is temporarily unavailable." in response.text
+        assert "aria-secret" not in response.text
+        assert "aria2.test" not in response.text
+
+    anyio.run(run_test)
+
+
+def test_multipart_group_projection_updates_display_without_writing_state(tmp_path: Any) -> None:
+    state_file = tmp_path / "groups.json"
+    store = main.GroupStateStore(str(state_file))
+    store.save_groups(
+        [
+            main.DownloadGroup(
+                id="group-1",
+                name="release",
+                created_at="2026-07-10T00:00:00+00:00",
+                updated_at="2026-07-10T00:00:00+00:00",
+                original_hosts=[],
+                parts=[
+                    main.DownloadGroupPart(
+                        aria2_gid="gid-1",
+                        filename="release.part1.rar",
+                        local_download_path="/downloads/release.part1.rar",
+                        status="submitted",
+                    ),
+                ],
+            ),
+        ],
+    )
+    active = QueueItem(
+        gid="gid-1",
+        status="active",
+        name="release.part1.rar",
+        total_length=1000,
+        completed_length=500,
+        download_speed=10,
+        eta_seconds=50,
+        error_message=None,
+        can_pause=True,
+        can_resume=False,
+        can_remove=True,
+        can_reorder=False,
+        can_clear=False,
+    )
+
+    class FakeAria2:
+        async def queue_snapshot(self) -> QueueSnapshot:
+            return QueueSnapshot(active=[active], waiting=[], stopped=[])
+
+    async def run_test() -> None:
+        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        app.dependency_overrides[main.get_group_store] = lambda: store
+        async with app_client() as client:
+            response = await client.get("/queue")
+
+        assert response.status_code == 200
+        assert "release.part1.rar - active" in response.text
+        assert "500 B / 1000 B" in response.text
+
+        persisted = store.load_groups()[0]
+        assert persisted.parts[0].status == "submitted"
+        assert persisted.parts[0].completed_length == 0
+
+    anyio.run(run_test)
+
+
+def test_group_state_clear_removes_only_eligible_terminal_group(tmp_path: Any) -> None:
+    store = main.GroupStateStore(str(tmp_path / "groups.json"))
+    active_group = main.DownloadGroup(
+        id="active-group",
+        name="active",
+        created_at="2026-07-10T00:00:00+00:00",
+        updated_at="2026-07-10T00:00:00+00:00",
+        original_hosts=[],
+        parts=[main.DownloadGroupPart("gid-active", "active.rar", "/downloads/active.rar", "active")],
+    )
+    terminal_group = main.DownloadGroup(
+        id="terminal-group",
+        name="terminal",
+        created_at="2026-07-10T00:00:00+00:00",
+        updated_at="2026-07-10T00:00:00+00:00",
+        original_hosts=[],
+        parts=[main.DownloadGroupPart("gid-done", "done.rar", "/downloads/done.rar", "complete")],
+    )
+    store.save_groups([active_group, terminal_group])
+
+    assert store.remove_group("active-group") is False
+    assert store.remove_group("terminal-group") is True
+    assert [group.id for group in store.load_groups()] == ["active-group"]
+
+
+def test_group_state_bulk_clear_preserves_active_groups(tmp_path: Any) -> None:
+    store = main.GroupStateStore(str(tmp_path / "groups.json"))
+    groups = [
+        main.DownloadGroup(
+            id="active-group",
+            name="active",
+            created_at="2026-07-10T00:00:00+00:00",
+            updated_at="2026-07-10T00:00:00+00:00",
+            original_hosts=[],
+            parts=[main.DownloadGroupPart("gid-active", "active.rar", "/downloads/active.rar", "paused")],
+        ),
+        main.DownloadGroup(
+            id="done-group",
+            name="done",
+            created_at="2026-07-10T00:00:00+00:00",
+            updated_at="2026-07-10T00:00:00+00:00",
+            original_hosts=[],
+            parts=[main.DownloadGroupPart("gid-done", "done.rar", "/downloads/done.rar", "complete")],
+        ),
+        main.DownloadGroup(
+            id="failed-extract-group",
+            name="failed-extract",
+            created_at="2026-07-10T00:00:00+00:00",
+            updated_at="2026-07-10T00:00:00+00:00",
+            original_hosts=[],
+            parts=[main.DownloadGroupPart("gid-extract", "extract.rar", "/downloads/extract.rar", "complete")],
+            extraction_status="failed",
+        ),
+    ]
+    store.save_groups(groups)
+
+    assert store.clear_eligible_groups() == 2
+    assert [group.id for group in store.load_groups()] == ["active-group"]
+
+
+def test_group_clear_routes_redirect_with_messages(tmp_path: Any) -> None:
+    store = main.GroupStateStore(str(tmp_path / "groups.json"))
+    store.save_groups(
+        [
+            main.DownloadGroup(
+                id="done-group",
+                name="done",
+                created_at="2026-07-10T00:00:00+00:00",
+                updated_at="2026-07-10T00:00:00+00:00",
+                original_hosts=[],
+                parts=[main.DownloadGroupPart("gid-done", "done.rar", "/downloads/done.rar", "complete")],
+            ),
+            main.DownloadGroup(
+                id="active-group",
+                name="active",
+                created_at="2026-07-10T00:00:00+00:00",
+                updated_at="2026-07-10T00:00:00+00:00",
+                original_hosts=[],
+                parts=[main.DownloadGroupPart("gid-active", "active.rar", "/downloads/active.rar", "active")],
+            ),
+        ],
+    )
+
+    async def run_test() -> None:
+        app.dependency_overrides[main.get_group_store] = lambda: store
+        async with app_client() as client:
+            single = await client.post("/queue/groups/done-group/clear")
+            active = await client.post("/queue/groups/active-group/clear")
+            bulk = await client.post("/queue/groups/clear")
+
+        assert single.status_code == 303
+        assert "Multipart+group+history+entry+cleared" in single.headers["location"]
+        assert active.status_code == 303
+        assert "level=error" in active.headers["location"]
+        assert bulk.status_code == 303
+        assert "No+completed+multipart+group+history" in bulk.headers["location"]
+
+    anyio.run(run_test)
+
+
+def test_api_group_clear_routes_return_json_messages(tmp_path: Any) -> None:
+    store = main.GroupStateStore(str(tmp_path / "groups.json"))
+    store.save_groups(
+        [
+            main.DownloadGroup(
+                id="done-group",
+                name="done",
+                created_at="2026-07-10T00:00:00+00:00",
+                updated_at="2026-07-10T00:00:00+00:00",
+                original_hosts=[],
+                parts=[main.DownloadGroupPart("gid-done", "done.rar", "/downloads/done.rar", "complete")],
+            ),
+            main.DownloadGroup(
+                id="active-group",
+                name="active",
+                created_at="2026-07-10T00:00:00+00:00",
+                updated_at="2026-07-10T00:00:00+00:00",
+                original_hosts=[],
+                parts=[main.DownloadGroupPart("gid-active", "active.rar", "/downloads/active.rar", "active")],
+            ),
+        ],
+    )
+
+    async def run_test() -> None:
+        app.dependency_overrides[main.get_group_store] = lambda: store
+        async with app_client() as client:
+            single = await client.post("/api/queue/groups/done-group/clear")
+            active = await client.post("/api/queue/groups/active-group/clear")
+            bulk = await client.post("/api/queue/groups/clear")
+
+        assert single.status_code == 200
+        assert single.json() == {"ok": True, "message": "Multipart group history entry cleared."}
+        assert active.status_code == 200
+        assert active.json()["ok"] is False
+        assert bulk.status_code == 200
+        assert bulk.json()["ok"] is False
 
     anyio.run(run_test)
 
@@ -679,6 +1137,74 @@ def test_extraction_failure_keeps_archive_parts(
     anyio.run(run_test)
 
 
+def test_non_archive_download_skips_extraction(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_test() -> None:
+        downloads = tmp_path / "downloads"
+        downloads.mkdir()
+        dmg = downloads / "installer.dmg"
+        dmg.write_text("disk image")
+
+        async def fake_extract_archive(start_file: str, output_dir: str, timeout_seconds: int) -> main.ExtractionResult:
+            raise AssertionError("non-archive downloads must not be extracted")
+
+        monkeypatch.setattr(main, "extract_archive", fake_extract_archive)
+        settings = make_settings(
+            app_download_dir=str(downloads),
+            group_state_file=str(tmp_path / "groups.json"),
+        )
+        monitor = main.GroupMonitor(settings)
+        group = main.DownloadGroup(
+            id="group-1",
+            name="installer",
+            created_at=main.now_iso(),
+            updated_at=main.now_iso(),
+            original_hosts=[],
+            parts=[main.DownloadGroupPart("gid-1", "installer.dmg", str(dmg), "complete")],
+        )
+
+        assert await monitor._maybe_extract(group) is True
+        assert group.extraction_status == "skipped"
+        assert group.extraction_error is None
+        assert group.extraction_output_path is None
+        assert dmg.exists()
+
+    anyio.run(run_test)
+
+
+def test_old_non_archive_extraction_failure_loads_as_skipped(tmp_path: Any) -> None:
+    state_file = tmp_path / "groups.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "id": "group-1",
+                        "name": "installer",
+                        "created_at": "2026-07-11T00:00:00+00:00",
+                        "updated_at": "2026-07-11T00:00:00+00:00",
+                        "original_hosts": ["rapidgator.net"],
+                        "extraction_status": "failed",
+                        "extraction_error": main.NO_SUPPORTED_ARCHIVE_MESSAGE,
+                        "parts": [
+                            {
+                                "aria2_gid": "gid-1",
+                                "filename": "installer.dmg",
+                                "local_download_path": "/downloads/installer.dmg",
+                                "status": "complete",
+                            },
+                        ],
+                    },
+                ],
+            },
+        ),
+    )
+
+    group = main.GroupStateStore(str(state_file)).load_groups()[0]
+
+    assert group.extraction_status == "skipped"
+    assert group.extraction_error is None
+
+
 def test_extracting_group_is_resumable_after_restart(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -728,6 +1254,7 @@ def make_settings(**overrides: Any) -> Settings:
         "group_state_file": f"{tempfile.gettempdir()}/rd-downloader-test-{uuid.uuid4().hex}.json",
         "extract_timeout_seconds": 7200,
         "group_poll_seconds": 30,
+        "queue_stream_interval_seconds": 1.0,
     }
     values.update(overrides)
     return Settings(**values)
