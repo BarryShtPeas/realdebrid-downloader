@@ -935,7 +935,10 @@ class GroupMonitor:
             completed_length = parse_int(status_payload.get("completedLength"))
             error_message = status_payload.get("errorMessage")
             filename = queue_item_name(status_payload)
-            path = queue_item_path(status_payload)
+            path = safe_download_path(
+                queue_item_path(status_payload),
+                self.settings.app_download_dir,
+            )
 
             if filename and filename != part.filename:
                 part.filename = filename
@@ -972,7 +975,11 @@ class GroupMonitor:
         if not group.parts or not all(part.status == "complete" for part in group.parts):
             return False
 
-        archive_paths = [part.local_download_path for part in group.parts if part.local_download_path]
+        archive_paths = [
+            path
+            for part in group.parts
+            if (path := safe_download_path(part.local_download_path, self.settings.app_download_dir))
+        ]
         start_file = select_archive_start_file(archive_paths)
         if start_file is None:
             group.extraction_status = "skipped"
@@ -1022,6 +1029,19 @@ def select_archive_start_file(paths: list[str]) -> str | None:
             if pattern.search(path):
                 return path
     return None
+
+
+def safe_download_path(path: str | None, download_dir: str) -> str | None:
+    if not path:
+        return None
+    try:
+        resolved_path = Path(path).resolve(strict=False)
+        resolved_download_dir = Path(download_dir).resolve(strict=False)
+        resolved_path.relative_to(resolved_download_dir)
+    except (OSError, ValueError):
+        logger.warning("Ignoring aria2 path outside configured download directory.")
+        return None
+    return str(resolved_path)
 
 
 async def extract_archive(

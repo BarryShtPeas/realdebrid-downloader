@@ -1137,6 +1137,81 @@ def test_extraction_uses_first_archive_part_and_deletes_after_success(
     anyio.run(run_test)
 
 
+def test_group_refresh_ignores_aria2_paths_outside_download_dir(tmp_path: Any) -> None:
+    async def run_test() -> None:
+        downloads = tmp_path / "downloads"
+        downloads.mkdir()
+        outside = tmp_path / "outside" / "release.part1.rar"
+        settings = make_settings(
+            app_download_dir=str(downloads),
+            group_state_file=str(tmp_path / "groups.json"),
+        )
+        monitor = main.GroupMonitor(settings)
+
+        class FakeAria2:
+            async def tell_status(self, gid: str) -> dict[str, Any]:
+                assert gid == "gid-1"
+                return {
+                    "gid": gid,
+                    "status": "complete",
+                    "files": [{"path": str(outside)}],
+                }
+
+        monitor.aria2 = FakeAria2()  # type: ignore[assignment]
+        group = main.DownloadGroup(
+            id="group-1",
+            name="release",
+            created_at=main.now_iso(),
+            updated_at=main.now_iso(),
+            original_hosts=[],
+            parts=[main.DownloadGroupPart("gid-1", None, None, "active")],
+        )
+
+        assert await monitor._refresh_group(group) is True
+        assert group.parts[0].filename == "release.part1.rar"
+        assert group.parts[0].local_download_path is None
+        assert group.parts[0].status == "complete"
+
+    anyio.run(run_test)
+
+
+def test_extraction_ignores_persisted_paths_outside_download_dir(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_test() -> None:
+        downloads = tmp_path / "downloads"
+        outside_dir = tmp_path / "outside"
+        downloads.mkdir()
+        outside_dir.mkdir()
+        outside = outside_dir / "release.part1.rar"
+        outside.write_text("part1")
+
+        async def fake_extract_archive(start_file: str, output_dir: str, timeout_seconds: int) -> main.ExtractionResult:
+            raise AssertionError("unsafe archive path must not be extracted")
+
+        monkeypatch.setattr(main, "extract_archive", fake_extract_archive)
+        settings = make_settings(
+            app_download_dir=str(downloads),
+            group_state_file=str(tmp_path / "groups.json"),
+        )
+        monitor = main.GroupMonitor(settings)
+        group = main.DownloadGroup(
+            id="group-1",
+            name="release",
+            created_at=main.now_iso(),
+            updated_at=main.now_iso(),
+            original_hosts=[],
+            parts=[main.DownloadGroupPart("gid-1", "release.part1.rar", str(outside), "complete")],
+        )
+
+        assert await monitor._maybe_extract(group) is True
+        assert group.extraction_status == "skipped"
+        assert outside.exists()
+
+    anyio.run(run_test)
+
+
 def test_extraction_failure_keeps_archive_parts(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
