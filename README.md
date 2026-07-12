@@ -130,6 +130,18 @@ URLs, or cookies.
 
 ## Local Development
 
+Required local tooling:
+
+- Python 3.12.
+- `pip`, or `uv` when Python is not installed in the development container.
+- Docker with the Compose plugin for running the full app plus aria2 stack.
+- 7-Zip (`7z`) only when testing archive extraction outside the app Docker image.
+
+The production app image installs Python dependencies and 7-Zip through the
+`Dockerfile`. Local Docker/Compose development still requires access to a Docker
+daemon; a locked-down Codex or CI helper container must either expose a Docker
+socket or bake Docker tooling into that helper image.
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
@@ -141,6 +153,14 @@ Run tests:
 
 ```bash
 pytest
+```
+
+When using `uv` in a restricted container, keep the cache in a writable path:
+
+```bash
+UV_CACHE_DIR="$PWD/.uv-cache" uv venv --python 3.12
+UV_CACHE_DIR="$PWD/.uv-cache" uv pip install -r requirements-dev.txt --python .venv/bin/python
+.venv/bin/python -m pytest
 ```
 
 Run the app with aria2:

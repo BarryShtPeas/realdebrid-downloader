@@ -40,6 +40,13 @@ The app uses `major.minor.bugfix` semantic versioning. The source of truth is `a
 
 ## Development Workflow
 
+Before starting development, make sure the environment has the repo tooling:
+Python 3.12, Python package installation through `pip` or `uv`, Docker with the
+Compose plugin for full-stack runs, and `7z` when testing extraction outside the
+Docker image. In restricted helper containers, install user-space tooling such
+as `uv` under the container user and use a writable cache, for example
+`UV_CACHE_DIR="$PWD/.uv-cache"`.
+
 1. Create a feature branch from `dev`.
 2. Make the change and add or update tests.
 3. Run the default test suite:

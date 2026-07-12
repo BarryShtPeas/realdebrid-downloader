@@ -1,5 +1,6 @@
 .env
 .venv/
+.uv-cache/
 .codex-tools/
 __pycache__/
 *.py[cod]
