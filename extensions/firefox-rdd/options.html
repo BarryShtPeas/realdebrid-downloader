@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RDD Sender Options</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <h1>RDD Sender</h1>
+      <p>Configure the Real-Debrid Downloader instance that receives submitted URLs.</p>
+
+      <form id="options-form">
+        <label>
+          RDD base URL
+          <input
+            id="rdd-base-url"
+            name="rdd-base-url"
+            type="url"
+            placeholder="http://localhost:8080"
+            autocomplete="url"
+            required
+          >
+        </label>
+        <div class="actions">
+          <button type="submit">Save</button>
+          <button id="test-connection" type="button">Test connection</button>
+        </div>
+      </form>
+
+      <p id="status" role="status" aria-live="polite"></p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

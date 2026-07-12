@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import uuid
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -78,6 +79,41 @@ def test_api_version_and_pages_include_app_version() -> None:
         assert f"v{main.__version__}" in page_response.text
 
     anyio.run(run_test)
+
+
+def test_firefox_extension_manifest_matches_app_version() -> None:
+    manifest_path = Path("extensions/firefox-rdd/manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["manifest_version"] == 3
+    assert manifest["version"] == main.__version__
+    assert manifest["name"] == "RDD Sender"
+    assert manifest["browser_specific_settings"]["gecko"]["id"] == "rdd-sender@realdebrid-downloader.local"
+    assert set(manifest["permissions"]) == {"menus", "notifications", "storage"}
+    assert manifest["optional_host_permissions"] == ["http://*/*", "https://*/*"]
+    assert manifest["background"]["scripts"] == ["background.js"]
+    assert manifest["options_ui"]["page"] == "options.html"
+
+
+def test_firefox_extension_uses_rdd_api_without_private_defaults() -> None:
+    extension_root = Path("extensions/firefox-rdd")
+    background = (extension_root / "background.js").read_text(encoding="utf-8")
+    options = (extension_root / "options.js").read_text(encoding="utf-8")
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in extension_root.iterdir()
+        if path.is_file() and path.suffix in {".js", ".json", ".html", ".md"}
+    )
+
+    assert "/api/submit" in background
+    assert "/api/version" in options
+    assert "browser.storage.local" in background
+    assert "browser.storage.local" in options
+    assert "browser.permissions.request" in options
+    assert "grace" not in combined.lower()
+    assert "lillystone" not in combined.lower()
+    assert "REALDEBRID_API_TOKEN" not in combined
+    assert "ARIA2_RPC_SECRET" not in combined
 
 
 def test_submit_success_does_not_echo_submitted_url() -> None:

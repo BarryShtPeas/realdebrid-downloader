@@ -117,6 +117,17 @@ Swagger UI is available at `/docs`, and the OpenAPI definition is available at `
 
 API responses are sanitized for clients. They include useful status, filename, progress, group, and aria2 id fields, but they do not include Real-Debrid tokens, aria2 RPC details, submitted full URLs, generated direct Real-Debrid URLs, or local download paths.
 
+## Firefox Extension
+
+An unpacked local Firefox WebExtension is available in `extensions/firefox-rdd`.
+It adds context-menu actions for sending links or selected text to an RDD
+instance through `POST /api/submit`, and it tests connectivity with
+`GET /api/version`.
+
+The extension stores only the configured RDD base URL in Firefox extension
+storage. It does not store Real-Debrid tokens, aria2 RPC secrets, submitted
+URLs, or cookies.
+
 ## Local Development
 
 ```bash

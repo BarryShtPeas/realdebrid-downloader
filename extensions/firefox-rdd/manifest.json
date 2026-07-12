@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "RDD Sender",
+  "description": "Send links and selected URLs to a Real-Debrid Downloader instance.",
+  "version": "0.1.0",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "rdd-sender@realdebrid-downloader.local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "menus",
+    "notifications",
+    "storage"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "RDD Sender"
+  }
+}
