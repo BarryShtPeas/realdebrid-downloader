@@ -255,7 +255,7 @@ To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, ngi
 
 ## Implementation Status
 
-The production Real-Debrid, aria2, multipart group tracking, and automatic extraction workflow is implemented in `app/main.py` with mocked tests for Real-Debrid, aria2, persistence, and extraction responses. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
+The production Real-Debrid, aria2, multipart group tracking, and automatic extraction workflow is implemented in `app/main.py` with mocked tests for Real-Debrid, aria2, persistence, and extraction responses. Server-rendered UI helpers live in `app/views.py`, and shared page styling and queue-page JavaScript live in `app/static/`. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
 
 ## Licence
 

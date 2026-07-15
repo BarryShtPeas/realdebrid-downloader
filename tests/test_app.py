@@ -183,7 +183,7 @@ def test_api_submit_returns_sanitized_json() -> None:
             )
 
     async def run_test() -> None:
-        app.dependency_overrides[get_downloader] = lambda: FakeDownloader()
+        app.dependency_overrides[get_downloader] = dependency_override(FakeDownloader())
         async with app_client() as client:
             response = await client.post("/api/submit", json={"url": submitted_text})
 
@@ -470,7 +470,7 @@ def test_queue_page_renders_downloads_and_controls() -> None:
             return QueueSnapshot(active=[active], waiting=[waiting], stopped=[stopped])
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
         async with app_client() as client:
             response = await client.get("/queue")
 
@@ -533,8 +533,8 @@ def test_api_queue_returns_sanitized_queue_and_group_state() -> None:
             return [group]
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
-        app.dependency_overrides[main.get_group_store] = lambda: FakeGroupStore()
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
+        app.dependency_overrides[main.get_group_store] = dependency_override(FakeGroupStore())
         async with app_client() as client:
             response = await client.get("/api/queue")
 
@@ -573,7 +573,7 @@ def test_api_queue_action_routes_call_aria2() -> None:
             calls.append("purge")
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
         async with app_client() as client:
             responses = [
                 await client.post("/api/queue/gid-1/pause"),
@@ -619,7 +619,7 @@ def test_queue_action_routes_call_aria2_and_redirect() -> None:
             calls.append(f"move:{gid}:{direction}")
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
         async with app_client() as client:
             responses = [
                 await client.post("/queue/gid-1/pause"),
@@ -650,7 +650,7 @@ def test_queue_page_handles_aria2_failure_without_leaking_secret() -> None:
             raise main.UpstreamError("aria2 rejected token:aria-secret at https://aria2.test/jsonrpc")
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
         async with app_client() as client:
             response = await client.get("/queue")
 
@@ -684,7 +684,7 @@ def test_queue_events_emits_live_queue_html() -> None:
             return QueueSnapshot(active=[active], waiting=[], stopped=[])
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
         async with app_client() as client:
             response = await client.get("/queue/events?once=true")
 
@@ -703,7 +703,7 @@ def test_queue_events_error_does_not_leak_aria2_secret_or_url() -> None:
             raise main.UpstreamError("token:aria-secret failed at https://aria2.test/jsonrpc")
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
         async with app_client() as client:
             response = await client.get("/queue/events?once=true")
 
@@ -759,8 +759,8 @@ def test_multipart_group_projection_updates_display_without_writing_state(tmp_pa
             return QueueSnapshot(active=[active], waiting=[], stopped=[])
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_aria2_client] = lambda: FakeAria2()
-        app.dependency_overrides[main.get_group_store] = lambda: store
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
+        app.dependency_overrides[main.get_group_store] = dependency_override(store)
         async with app_client() as client:
             response = await client.get("/queue")
 
@@ -859,7 +859,7 @@ def test_group_clear_routes_redirect_with_messages(tmp_path: Any) -> None:
     )
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_group_store] = lambda: store
+        app.dependency_overrides[main.get_group_store] = dependency_override(store)
         async with app_client() as client:
             single = await client.post("/queue/groups/done-group/clear")
             active = await client.post("/queue/groups/active-group/clear")
@@ -899,7 +899,7 @@ def test_api_group_clear_routes_return_json_messages(tmp_path: Any) -> None:
     )
 
     async def run_test() -> None:
-        app.dependency_overrides[main.get_group_store] = lambda: store
+        app.dependency_overrides[main.get_group_store] = dependency_override(store)
         async with app_client() as client:
             single = await client.post("/api/queue/groups/done-group/clear")
             active = await client.post("/api/queue/groups/active-group/clear")
@@ -1369,6 +1369,13 @@ def make_settings(**overrides: Any) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)
+
+
+def dependency_override(value: Any) -> Any:
+    async def override() -> Any:
+        return value
+
+    return override
 
 
 def app_client() -> httpx.AsyncClient:
