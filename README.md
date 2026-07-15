@@ -138,9 +138,15 @@ Required local tooling:
 - 7-Zip (`7z`) only when testing archive extraction outside the app Docker image.
 
 The production app image installs Python dependencies and 7-Zip through the
-`Dockerfile`. Local Docker/Compose development still requires access to a Docker
-daemon; a locked-down Codex or CI helper container must either expose a Docker
-socket or bake Docker tooling into that helper image.
+`Dockerfile`. Agent or LLM helper containers are development infrastructure, not
+the app runtime image. If an agent container needs to build images or run
+Compose, it must have Docker CLI tooling, the Compose plugin, access to a Docker
+daemon, and repository mounts that resolve the same way for the host Docker
+daemon. See [Remote Agent Development Container](docs/development-container.md).
+The checked-in `.devcontainer/` setup provides a generic agent/dev image for
+that workflow without changing the production app image.
+
+Python-only development loop:
 
 ```bash
 python3 -m venv .venv
@@ -161,6 +167,14 @@ When using `uv` in a restricted container, keep the cache in a writable path:
 UV_CACHE_DIR="$PWD/.uv-cache" uv venv --python 3.12
 UV_CACHE_DIR="$PWD/.uv-cache" uv pip install -r requirements-dev.txt --python .venv/bin/python
 .venv/bin/python -m pytest
+```
+
+Full Docker development loop:
+
+```bash
+docker version
+docker compose version
+docker compose -f compose.example.yml config
 ```
 
 Run the app with aria2:

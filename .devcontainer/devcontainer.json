@@ -1,0 +1,26 @@
+{
+  "name": "realdebrid-downloader-agent-dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "USERNAME": "agent"
+    }
+  },
+  "remoteUser": "agent",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=cached",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "runArgs": [
+    "--mount=type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock"
+  ],
+  "containerEnv": {
+    "UV_CACHE_DIR": "${containerWorkspaceFolder}/.uv-cache"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pytest"
+      ]
+    }
+  }
+}

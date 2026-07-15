@@ -47,6 +47,26 @@ Docker image. In restricted helper containers, install user-space tooling such
 as `uv` under the container user and use a writable cache, for example
 `UV_CACHE_DIR="$PWD/.uv-cache"`.
 
+Remote LLM or agent development should use a generic development container, not
+an app runtime container and not an agent-specific container name. That helper
+container may run Codex, Claude, or another coding tool, but it must expose the
+same repo instructions and tooling to each agent. See
+`docs/development-container.md` for the expected Docker socket and path-mount
+contract.
+
+Before relying on Docker validation from an agent session, check:
+
+```bash
+.venv/bin/python -m pytest
+docker version
+docker compose version
+docker compose -f compose.example.yml config
+```
+
+If Docker is unavailable, the agent can still edit code and run the Python test
+suite, but it must report that image builds and Compose runs were not locally
+validated.
+
 1. Create a feature branch from `dev`.
 2. Make the change and add or update tests.
 3. Run the default test suite:

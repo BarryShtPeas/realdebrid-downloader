@@ -10,6 +10,8 @@ This repository is the standalone, self-hostable source for the Real-Debrid down
 - Do not log full submitted URLs by default. If diagnostic logging is required, redact tokens, query strings, and path material that could identify private downloads.
 - Update `README.md` whenever environment variables, runtime behavior, Real-Debrid API assumptions, aria2 behavior, image tags, or deployment steps change.
 - Prefer tests with mocked Real-Debrid API and aria2 JSON-RPC responses. Do not require a live Real-Debrid account for the default test suite.
+- Do not assume Docker is available in an LLM or helper container. If you validate a change, clearly report whether you ran only the Python test suite or also Docker/Compose checks.
+- Treat Docker socket access as privileged host access. Keep agent helper containers generic and separate from the production app image.
 
 ## Current Scope
 
