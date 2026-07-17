@@ -1,10 +1,10 @@
 # Real-Debrid Downloader
 
-Small self-hosted web app for submitting Real-Debrid-supported hoster links and handing the unrestricted download URL to an internal aria2 downloader.
+Small self-hosted web app for submitting Real-Debrid-supported hoster links or magnet links and handing the generated download URLs to an internal aria2 downloader.
 
 ## Purpose
 
-This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs. Paste a single link or free text containing multiple links, and the app extracts URLs, unrestricts them through Real-Debrid, and hands the direct downloads to an internal aria2 worker. Multipart archive submissions are tracked as one group and extracted automatically after all parts complete.
+This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs plus magnet links. Paste a single link or free text containing multiple links, and the app extracts submissions, resolves them through Real-Debrid, and hands the direct downloads to an internal aria2 worker. Multipart archive and torrent submissions are tracked as one group and extracted automatically after all parts complete.
 
 The runtime model is:
 
@@ -15,7 +15,7 @@ The runtime model is:
 
 ## Download Flow
 
-1. The operator submits a hoster URL or free text containing multiple hoster URLs.
+1. The operator submits a hoster URL, magnet link, or free text containing multiple links.
 2. The app checks Real-Debrid supported hosts through `/hosts/domains` when that metadata is available.
 3. The app calls `/unrestrict/check` to check whether Real-Debrid currently has a downloadable file for that link.
 4. The app calls `/unrestrict/link` with the submitted URL.
@@ -23,7 +23,9 @@ The runtime model is:
 6. The web UI shows the filename, aria2 id, and generated Real-Debrid direct download URL.
 7. aria2 downloads the file to `/downloads`.
 
-When multiple URLs are pasted, the app preserves the first occurrence of each exact URL and submits each URL independently. Submitted multipart parts are stored as one group in `/config/download-groups.json` by default. The group state stores original hostnames, aria2 ids, filenames, local paths, status, and extraction state; it does not store full submitted URLs.
+For magnet links, the app calls `/torrents/addMagnet`, waits for torrent file metadata, selects all files with `/torrents/selectFiles/{id}`, then polls `/torrents/info/{id}` until Real-Debrid returns downloadable links or the configured timeout expires. Each returned torrent link is unrestricted through `/unrestrict/link` and submitted to aria2 as a normal download. Web-form magnet submissions redirect to the queue immediately while this Real-Debrid handoff continues in the background; API submissions keep returning a synchronous JSON result.
+
+When multiple links are pasted, the app preserves the first occurrence of each exact hoster URL or magnet link and submits each independently. Submitted multipart parts and torrent files are stored as one group in `/config/download-groups.json` by default. The group state stores original hostnames or the generic `magnet link` label, aria2 ids, filenames, local paths, status, and extraction state; it does not store full submitted URLs or magnet hashes.
 
 The app polls aria2 for tracked groups every 30 seconds by default. After every part in a group reaches `complete`, it looks for a supported archive start file, preferring `.part1.rar`, then `.rar`, `.zip`, and `.7z`. Extraction runs with 7-Zip into `/downloads/<group-name>/`. Archive part files are deleted only after extraction succeeds; failed extraction leaves archive files in place and marks the group failed. Completed non-archive downloads, such as `.dmg` files, are marked `skipped` for extraction and are left in place.
 
@@ -51,6 +53,9 @@ Relevant endpoints for the initial implementation:
 | `GET /hosts`, `GET /hosts/status`, `GET /hosts/regex` | Optional supported-host and matching metadata. |
 | `POST /unrestrict/check` | Check whether a hoster link is currently downloadable. |
 | `POST /unrestrict/link` | Generate an unrestricted direct download URL. |
+| `POST /torrents/addMagnet` | Add a magnet link to Real-Debrid. |
+| `GET /torrents/info/{id}` | Read torrent file, status, and generated link metadata. |
+| `POST /torrents/selectFiles/{id}` | Select torrent files; RDD selects `all` for v1. |
 
 Most Real-Debrid endpoints require authentication. Do not include `REALDEBRID_API_TOKEN` in logs, rendered pages, screenshots, examples, or issue text.
 
@@ -72,6 +77,8 @@ Copy `.env.example` to `.env` for local development and fill in only local secre
 | `APP_EXTRACT_TIMEOUT_SECONDS` | no | `7200` | Maximum 7-Zip extraction time per group. |
 | `APP_GROUP_POLL_SECONDS` | no | `30` | aria2 polling interval for tracked multipart groups. Set to `0` to disable the background poller. |
 | `APP_QUEUE_STREAM_INTERVAL_SECONDS` | no | `1` | Server-Sent Events refresh interval for the `/queue` page. |
+| `APP_TORRENT_POLL_SECONDS` | no | `5` | Poll interval while waiting for Real-Debrid magnet metadata and generated torrent links. |
+| `APP_TORRENT_READY_TIMEOUT_SECONDS` | no | `900` | Maximum synchronous wait for a submitted magnet to become downloadable. |
 | `ARIA2_RPC_URL` | yes | `http://rd-aria2:6800/jsonrpc` | Internal aria2 JSON-RPC URL. |
 | `ARIA2_RPC_SECRET` | recommended | none | aria2 RPC token. |
 | `ARIA2_DOWNLOAD_DIR` | no | `/downloads` | Directory passed to aria2. |
@@ -107,7 +114,7 @@ Queue actions redirect back to `/queue`. Live updates resume after the redirect.
 RDD exposes a JSON API for integrations such as browser extensions:
 
 - `GET /api/version` returns the app name and semantic version.
-- `POST /api/submit` accepts `{"url": "..."}` where the value can be one URL or free text containing multiple URLs.
+- `POST /api/submit` accepts `{"url": "..."}` where the value can be one hoster URL, one magnet link, or free text containing multiple links.
 - `GET /api/queue` returns sanitized queue and multipart group state.
 - `POST /api/queue/{gid}/pause`, `/resume`, `/remove`, and `/clear` control aria2 queue entries.
 - `POST /api/queue/clear-stopped` clears aria2 stopped history.
@@ -115,7 +122,7 @@ RDD exposes a JSON API for integrations such as browser extensions:
 
 Swagger UI is available at `/docs`, and the OpenAPI definition is available at `/openapi.json`. UI-only routes such as `/submit`, `/queue/events`, and redirect-based queue controls are intentionally excluded from the API schema.
 
-API responses are sanitized for clients. They include useful status, filename, progress, group, and aria2 id fields, but they do not include Real-Debrid tokens, aria2 RPC details, submitted full URLs, generated direct Real-Debrid URLs, or local download paths.
+API responses are sanitized for clients. They include useful status, filename, progress, group, aria2 id, and submitted hostnames for hoster links, but they do not include Real-Debrid tokens, aria2 RPC details, submitted full URLs, magnet links, magnet hashes, generated direct Real-Debrid URLs, or local download paths.
 
 ## Firefox Extension
 
@@ -260,8 +267,9 @@ To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, ngi
 
 - Never commit real Real-Debrid or GitHub tokens.
 - Never log full submitted URLs by default. The app logs only the submitted URL hostname, and the optional diagnostic flag still redacts path and query material.
-- Multipart group state stores only original hostnames and operational aria2/file metadata, not full submitted URLs.
-- Treat submitted URLs as private operator data.
+- Magnet submissions are logged only as a generic magnet-link event.
+- Multipart group state stores only original hostnames or a generic magnet label and operational aria2/file metadata, not full submitted URLs or magnet hashes.
+- Treat submitted URLs and magnet links as private operator data.
 - The submit result page displays the generated Real-Debrid direct download URL in the browser UI. Protect the app route accordingly.
 - Keep aria2 JSON-RPC internal to the Docker network.
 - Queue controls can pause, resume, remove, and reorder downloads. Do not expose this app publicly without access control.
@@ -269,7 +277,7 @@ To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, ngi
 
 ## Implementation Status
 
-The production Real-Debrid, aria2, multipart group tracking, and automatic extraction workflow is implemented in `app/main.py` with mocked tests for Real-Debrid, aria2, persistence, and extraction responses. Server-rendered UI helpers live in `app/views.py`, and shared page styling and queue-page JavaScript live in `app/static/`. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
+The production Real-Debrid hoster/torrent, aria2, multipart group tracking, and automatic extraction workflow is implemented in `app/main.py` with mocked tests for Real-Debrid, aria2, persistence, and extraction responses. Server-rendered UI helpers live in `app/views.py`, and shared page styling and queue-page JavaScript live in `app/static/`. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
 
 ## Licence
 

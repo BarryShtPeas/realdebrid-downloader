@@ -216,6 +216,44 @@ def test_submit_shows_required_no_download_message() -> None:
     anyio.run(run_test)
 
 
+def test_form_magnet_submit_redirects_to_queue_and_runs_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_tasks: list[Any] = []
+    submitted_texts: list[str] = []
+    magnet = "magnet:?xt=urn:btih:BACKGROUND_HASH"
+
+    def fake_create_task(coro: Any) -> object:
+        created_tasks.append(coro)
+        return object()
+
+    class FakeDownloader:
+        async def submit_text(self, text: str) -> main.SubmissionResult:
+            submitted_texts.append(text)
+            return main.SubmissionResult(
+                ok=True,
+                message="submitted",
+                downloads=[DownloadResult(ok=True, message="ok", aria2_gid="gid-1")],
+            )
+
+    async def run_test() -> None:
+        monkeypatch.setattr(main.asyncio, "create_task", fake_create_task)
+        app.dependency_overrides[get_downloader] = dependency_override(FakeDownloader())
+        async with app_client() as client:
+            response = await client.post("/submit", data={"url": magnet})
+
+        assert response.status_code == 303
+        assert response.headers["location"].startswith("/queue?")
+        assert "Magnet+submission+started" in response.headers["location"]
+        assert submitted_texts == []
+        assert len(created_tasks) == 1
+
+        await created_tasks[0]
+        assert submitted_texts == [magnet]
+
+    anyio.run(run_test)
+
+
 def test_downloader_attempts_unrestrict_when_supported_hosts_are_inconclusive() -> None:
     async def run_test() -> None:
         settings = make_settings()
@@ -358,6 +396,69 @@ def test_real_debrid_and_aria2_clients_use_expected_endpoints(
             "/rest/1.0/unrestrict/check",
             "/rest/1.0/unrestrict/link",
             "/jsonrpc",
+        ]
+
+    anyio.run(run_test)
+
+
+def test_real_debrid_torrent_client_uses_expected_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_test() -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path == "/rest/1.0/torrents/addMagnet":
+                assert request.method == "POST"
+                assert request.headers["authorization"] == "Bearer token-1"
+                assert request.content == b"magnet=magnet%3A%3Fxt%3Durn%3Abtih%3Aabc123"
+                return httpx.Response(201, json={"id": "torrent-1", "uri": "https://rd.example/torrent-1"})
+            if request.url.path == "/rest/1.0/torrents/info/torrent-1":
+                assert request.method == "GET"
+                assert request.headers["authorization"] == "Bearer token-1"
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "torrent-1",
+                        "status": "downloaded",
+                        "files": [{"id": 1, "path": "/movie.mkv", "selected": 1}],
+                        "links": ["https://hoster.example/torrent-file"],
+                    },
+                )
+            if request.url.path == "/rest/1.0/torrents/selectFiles/torrent-1":
+                assert request.method == "POST"
+                assert request.headers["authorization"] == "Bearer token-1"
+                assert request.content == b"files=all"
+                return httpx.Response(202)
+            if request.url.path == "/rest/1.0/torrents/delete/torrent-1":
+                assert request.method == "DELETE"
+                assert request.headers["authorization"] == "Bearer token-1"
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        transport = httpx.MockTransport(handler)
+
+        class MockAsyncClient(httpx.AsyncClient):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                kwargs["transport"] = transport
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+        rd = RealDebridClient(make_settings(realdebrid_api_base_url="https://rd.test/rest/1.0"))
+
+        added = await rd.add_magnet("magnet:?xt=urn:btih:abc123")
+        info = await rd.torrent_info("torrent-1")
+        await rd.select_torrent_files("torrent-1")
+        await rd.delete_torrent("torrent-1")
+
+        assert added["id"] == "torrent-1"
+        assert info["links"] == ["https://hoster.example/torrent-file"]
+        assert [request.url.path for request in requests] == [
+            "/rest/1.0/torrents/addMagnet",
+            "/rest/1.0/torrents/info/torrent-1",
+            "/rest/1.0/torrents/selectFiles/torrent-1",
+            "/rest/1.0/torrents/delete/torrent-1",
         ]
 
     anyio.run(run_test)
@@ -932,6 +1033,21 @@ def test_extract_urls_from_free_text() -> None:
     ]
 
 
+def test_extract_urls_accepts_magnet_links_and_deduplicates() -> None:
+    text = """
+    magnet: magnet:?xt=urn:btih:ABC123&dn=Release
+    duplicate: (magnet:?xt=urn:btih:ABC123&dn=Release)
+    hoster: https://rapidgator.example/file.rar,
+    trailing quote: "magnet:?xt=urn:btih:DEF456".
+    """
+
+    assert main.extract_urls(text) == [
+        "magnet:?xt=urn:btih:ABC123&dn=Release",
+        "https://rapidgator.example/file.rar",
+        "magnet:?xt=urn:btih:DEF456",
+    ]
+
+
 def test_multi_url_submit_creates_group_and_does_not_persist_submitted_urls(
     tmp_path: Any,
 ) -> None:
@@ -979,6 +1095,217 @@ def test_multi_url_submit_creates_group_and_does_not_persist_submitted_urls(
         assert "rapidgator.example" in persisted
         assert "token=one" not in persisted
         assert "/private/" not in persisted
+
+    anyio.run(run_test)
+
+
+def test_magnet_submit_unrestricts_ready_torrent_links_and_persists_sanitized_group(
+    tmp_path: Any,
+) -> None:
+    async def run_test() -> None:
+        settings = make_settings(
+            group_state_file=str(tmp_path / "groups.json"),
+            torrent_poll_seconds=0.01,
+            torrent_ready_timeout_seconds=1,
+        )
+        downloader = Downloader(settings)
+        calls: list[str] = []
+
+        class FakeRealDebrid:
+            async def add_magnet(self, magnet_link: str) -> dict[str, Any]:
+                calls.append("add_magnet")
+                assert magnet_link == "magnet:?xt=urn:btih:SECRET_HASH&dn=release"
+                return {"id": "torrent-1", "uri": "https://rd.example/torrent-1"}
+
+            async def torrent_info(self, torrent_id: str) -> dict[str, Any]:
+                calls.append(f"torrent_info:{torrent_id}")
+                return {
+                    "id": torrent_id,
+                    "status": "downloaded",
+                    "files": [{"id": 1, "path": "/release.part1.rar", "selected": 1}],
+                    "links": [
+                        "https://hoster.example/release.part1.rar",
+                        "https://hoster.example/release.part2.rar",
+                    ],
+                }
+
+            async def select_torrent_files(self, torrent_id: str, files: str = "all") -> None:
+                calls.append(f"select:{torrent_id}:{files}")
+
+            async def unrestrict_link(self, submitted_url: str) -> dict[str, Any]:
+                calls.append(f"unrestrict:{submitted_url}")
+                basename = submitted_url.rsplit("/", 1)[-1]
+                return {
+                    "download": f"https://download.example/{basename}?token=rd-secret",
+                    "filename": basename,
+                }
+
+        class FakeAria2:
+            async def add_uri(self, direct_url: str) -> str:
+                calls.append(f"add_uri:{direct_url}")
+                return f"gid-{len([call for call in calls if call.startswith('add_uri:')])}"
+
+        downloader.realdebrid = FakeRealDebrid()  # type: ignore[assignment]
+        downloader.aria2 = FakeAria2()  # type: ignore[assignment]
+
+        submission = await downloader.submit_text("magnet:?xt=urn:btih:SECRET_HASH&dn=release")
+
+        assert submission.ok is True
+        assert submission.message == "Submitted 2 parts to aria2 as one multipart group."
+        assert [download.filename for download in submission.downloads] == [
+            "release.part1.rar",
+            "release.part2.rar",
+        ]
+        assert submission.group is not None
+        assert submission.group.original_hosts == ["magnet link"]
+        persisted = (tmp_path / "groups.json").read_text()
+        assert "magnet link" in persisted
+        assert "SECRET_HASH" not in persisted
+        assert "magnet:?" not in persisted
+        assert "token=rd-secret" not in persisted
+        assert calls == [
+            "add_magnet",
+            "torrent_info:torrent-1",
+            "select:torrent-1:all",
+            "torrent_info:torrent-1",
+            "unrestrict:https://hoster.example/release.part1.rar",
+            "add_uri:https://download.example/release.part1.rar?token=rd-secret",
+            "unrestrict:https://hoster.example/release.part2.rar",
+            "add_uri:https://download.example/release.part2.rar?token=rd-secret",
+        ]
+
+    anyio.run(run_test)
+
+
+def test_magnet_submit_waits_for_real_debrid_links(tmp_path: Any) -> None:
+    async def run_test() -> None:
+        settings = make_settings(
+            group_state_file=str(tmp_path / "groups.json"),
+            torrent_poll_seconds=0.01,
+            torrent_ready_timeout_seconds=1,
+        )
+        downloader = Downloader(settings)
+        info_calls = 0
+
+        class FakeRealDebrid:
+            async def add_magnet(self, magnet_link: str) -> dict[str, Any]:
+                return {"id": "torrent-1"}
+
+            async def torrent_info(self, torrent_id: str) -> dict[str, Any]:
+                nonlocal info_calls
+                info_calls += 1
+                if info_calls == 1:
+                    return {
+                        "status": "waiting_files_selection",
+                        "files": [{"id": 1, "path": "/release.mkv", "selected": 0}],
+                        "links": [],
+                    }
+                if info_calls == 2:
+                    return {
+                        "status": "downloading",
+                        "files": [{"id": 1, "path": "/release.mkv", "selected": 1}],
+                        "links": [],
+                    }
+                return {
+                    "status": "downloaded",
+                    "files": [{"id": 1, "path": "/release.mkv", "selected": 1}],
+                    "links": ["https://hoster.example/release.mkv"],
+                }
+
+            async def select_torrent_files(self, torrent_id: str, files: str = "all") -> None:
+                assert files == "all"
+
+            async def unrestrict_link(self, submitted_url: str) -> dict[str, Any]:
+                return {
+                    "download": "https://download.example/release.mkv",
+                    "filename": "release.mkv",
+                }
+
+        class FakeAria2:
+            async def add_uri(self, direct_url: str) -> str:
+                return "gid-1"
+
+        downloader.realdebrid = FakeRealDebrid()  # type: ignore[assignment]
+        downloader.aria2 = FakeAria2()  # type: ignore[assignment]
+
+        submission = await downloader.submit_text("magnet:?xt=urn:btih:WAITING_HASH")
+
+        assert submission.ok is True
+        assert info_calls == 3
+        assert submission.downloads[0].aria2_gid == "gid-1"
+
+    anyio.run(run_test)
+
+
+def test_magnet_terminal_error_returns_sanitized_failure() -> None:
+    async def run_test() -> None:
+        downloader = Downloader(make_settings(torrent_poll_seconds=0.01, torrent_ready_timeout_seconds=1))
+
+        class FakeRealDebrid:
+            async def add_magnet(self, magnet_link: str) -> dict[str, Any]:
+                return {"id": "torrent-1"}
+
+            async def torrent_info(self, torrent_id: str) -> dict[str, Any]:
+                return {"status": "magnet_error", "files": [], "links": []}
+
+        class FakeAria2:
+            async def add_uri(self, direct_url: str) -> str:
+                raise AssertionError("aria2 should not be called for a failed torrent")
+
+        downloader.realdebrid = FakeRealDebrid()  # type: ignore[assignment]
+        downloader.aria2 = FakeAria2()  # type: ignore[assignment]
+
+        submission = await downloader.submit_text("magnet:?xt=urn:btih:BAD_HASH")
+
+        assert submission.ok is False
+        assert submission.message == main.TORRENT_PROCESSING_FAILED_MESSAGE
+        assert submission.downloads[0].source_label == "magnet link"
+        assert "BAD_HASH" not in submission.message
+
+    anyio.run(run_test)
+
+
+def test_mixed_hoster_and_magnet_submission_reports_partial_success(tmp_path: Any) -> None:
+    async def run_test() -> None:
+        settings = make_settings(group_state_file=str(tmp_path / "groups.json"))
+        downloader = Downloader(settings)
+
+        class FakeRealDebrid:
+            async def supported_domains(self) -> set[str]:
+                return {"rapidgator.example"}
+
+            async def check_link(self, submitted_url: str) -> dict[str, Any]:
+                return {"supported": 1}
+
+            async def unrestrict_link(self, submitted_url: str) -> dict[str, Any]:
+                return {
+                    "download": "https://download.example/file.rar",
+                    "filename": "file.rar",
+                }
+
+            async def add_magnet(self, magnet_link: str) -> dict[str, Any]:
+                return {"id": "torrent-1"}
+
+            async def torrent_info(self, torrent_id: str) -> dict[str, Any]:
+                return {"status": "dead", "files": [], "links": []}
+
+        class FakeAria2:
+            async def add_uri(self, direct_url: str) -> str:
+                return "gid-1"
+
+        downloader.realdebrid = FakeRealDebrid()  # type: ignore[assignment]
+        downloader.aria2 = FakeAria2()  # type: ignore[assignment]
+
+        submission = await downloader.submit_text(
+            "https://rapidgator.example/file.rar\n"
+            "magnet:?xt=urn:btih:BAD_HASH",
+        )
+
+        assert submission.ok is True
+        assert submission.message == "Submitted 1 of 2 parts to aria2. 1 part(s) failed."
+        assert [download.ok for download in submission.downloads] == [True, False]
+        assert submission.group is not None
+        assert submission.group.original_hosts == ["rapidgator.example", "magnet link"]
 
     anyio.run(run_test)
 
@@ -1366,6 +1693,8 @@ def make_settings(**overrides: Any) -> Settings:
         "extract_timeout_seconds": 7200,
         "group_poll_seconds": 30,
         "queue_stream_interval_seconds": 1.0,
+        "torrent_poll_seconds": 0.01,
+        "torrent_ready_timeout_seconds": 1,
     }
     values.update(overrides)
     return Settings(**values)

@@ -36,8 +36,8 @@ def render_page(result: Any | None = None) -> str:
                 details.append("Real-Debrid did not list this host, but unrestrict was attempted.")
         failed_downloads = [download for download in downloads if not download.ok]
         for failed in failed_downloads:
-            host = failed.submitted_hostname or "unknown host"
-            details.append(f"{html.escape(host)}: {html.escape(failed.message)}")
+            source = failed.source_label or failed.submitted_hostname or "unknown source"
+            details.append(f"{html.escape(source)}: {html.escape(failed.message)}")
         detail_html = "".join(f"<p>{detail}</p>" for detail in details)
         result_html = (
             f'<section class="result {status}" role="status">'
@@ -62,12 +62,12 @@ def render_page(result: Any | None = None) -> str:
             <a href="/queue">Queue</a>
           </nav>
           <h1>Real-Debrid Downloader</h1>
-          <p>Submit a hoster link and send the unrestricted download to the internal aria2 worker.</p>
+          <p>Submit a hoster link or magnet link and send the Real-Debrid download to the internal aria2 worker.</p>
           {result_html}
           <form class="submit-form" method="post" action="/submit">
             <label>
-              Hoster URLs
-              <textarea name="url" required autocomplete="off" placeholder="Paste one URL or a block of text containing multiple URLs"></textarea>
+              Hoster URLs or magnet links
+              <textarea name="url" required autocomplete="off" placeholder="Paste one URL, magnet link, or a block of text containing multiple links"></textarea>
             </label>
             <button type="submit">Submit to aria2</button>
           </form>

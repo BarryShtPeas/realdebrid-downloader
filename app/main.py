@@ -31,7 +31,10 @@ from app.views import (
 
 
 NO_DOWNLOAD_MESSAGE = "No download available from Real-Debrid for this link."
+NO_TORRENT_READY_MESSAGE = "Torrent is not ready on Real-Debrid yet. Please try again later."
+TORRENT_PROCESSING_FAILED_MESSAGE = "Real-Debrid could not process this magnet link."
 NO_SUPPORTED_ARCHIVE_MESSAGE = "Could not find a supported archive start file."
+TORRENT_ERROR_STATUSES = {"magnet_error", "error", "virus", "dead"}
 
 logger = logging.getLogger("rd_downloader")
 
@@ -64,7 +67,11 @@ app = FastAPI(
 
 
 class ApiSubmitRequest(BaseModel):
-    url: str = Field(..., min_length=1, description="One URL or free text containing one or more URLs.")
+    url: str = Field(
+        ...,
+        min_length=1,
+        description="One hoster URL, magnet link, or free text containing one or more links.",
+    )
 
 
 class ApiDownloadResult(BaseModel):
@@ -156,6 +163,8 @@ class Settings:
     extract_timeout_seconds: int
     group_poll_seconds: int
     queue_stream_interval_seconds: float
+    torrent_poll_seconds: float
+    torrent_ready_timeout_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -184,6 +193,8 @@ class Settings:
             extract_timeout_seconds=parse_env_int("APP_EXTRACT_TIMEOUT_SECONDS", 7200),
             group_poll_seconds=parse_env_int("APP_GROUP_POLL_SECONDS", 30),
             queue_stream_interval_seconds=parse_env_float("APP_QUEUE_STREAM_INTERVAL_SECONDS", 1.0),
+            torrent_poll_seconds=parse_env_float("APP_TORRENT_POLL_SECONDS", 5.0),
+            torrent_ready_timeout_seconds=parse_env_int("APP_TORRENT_READY_TIMEOUT_SECONDS", 900),
         )
 
 
@@ -198,6 +209,7 @@ class DownloadResult:
     group_id: str | None = None
     local_path: str | None = None
     submitted_hostname: str | None = None
+    source_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -426,25 +438,35 @@ def group_to_dict(group: DownloadGroup) -> dict[str, Any]:
     return asdict(group)
 
 
-URL_PATTERN = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
+SUBMISSION_PATTERN = re.compile(r"https?://[^\s<>'\"]+|magnet:\?[^\s<>'\"]+", re.IGNORECASE)
 URL_LEADING_TRIM = "([{'\""
 URL_TRAILING_TRIM = ".,;:!?)]}'\""
 
 
 def extract_urls(text: str) -> list[str]:
-    urls: list[str] = []
+    submissions: list[str] = []
     seen: set[str] = set()
-    for match in URL_PATTERN.finditer(text):
-        url = match.group(0).strip(URL_LEADING_TRIM).rstrip(URL_TRAILING_TRIM)
-        if url and url not in seen:
-            urls.append(url)
-            seen.add(url)
-    return urls
+    for match in SUBMISSION_PATTERN.finditer(text):
+        submission = match.group(0).strip(URL_LEADING_TRIM).rstrip(URL_TRAILING_TRIM)
+        if submission and submission not in seen:
+            submissions.append(submission)
+            seen.add(submission)
+    return submissions
+
+
+def is_magnet_link(submission: str) -> bool:
+    return submission.lower().startswith("magnet:?")
 
 
 def submitted_hostname(submitted_url: str) -> str:
     parsed = urlparse(submitted_url)
     return parsed.hostname.lower() if parsed.hostname else "unknown-host"
+
+
+def submitted_source_label(submission: str) -> str:
+    if is_magnet_link(submission):
+        return "magnet link"
+    return submitted_hostname(submission)
 
 
 def now_iso() -> str:
@@ -557,6 +579,70 @@ class RealDebridClient:
             raise DownloadUnavailableError
         return payload
 
+    async def add_magnet(self, magnet_link: str) -> dict[str, Any]:
+        response = await self._post_authenticated(
+            "torrents/addMagnet",
+            data={"magnet": magnet_link},
+        )
+        if response.status_code in {400, 404, 503}:
+            raise DownloadUnavailableError
+        self._raise_for_unexpected_status(response)
+        if response.status_code != 201:
+            raise UpstreamError("Real-Debrid returned an unexpected torrent add response.")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise UpstreamError("Real-Debrid addMagnet returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise DownloadUnavailableError
+        return payload
+
+    async def torrent_info(self, torrent_id: str) -> dict[str, Any]:
+        response = await self._get_authenticated(f"torrents/info/{torrent_id}")
+        if response.status_code in {400, 404, 503}:
+            raise DownloadUnavailableError
+        self._raise_for_unexpected_status(response)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise UpstreamError("Real-Debrid torrent info returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise DownloadUnavailableError
+        return payload
+
+    async def select_torrent_files(self, torrent_id: str, files: str = "all") -> None:
+        response = await self._post_authenticated(
+            f"torrents/selectFiles/{torrent_id}",
+            data={"files": files},
+        )
+        if response.status_code == 202:
+            return
+        if response.status_code in {400, 404, 503}:
+            raise DownloadUnavailableError
+        self._raise_for_unexpected_status(response)
+        if response.status_code != 204:
+            raise UpstreamError("Real-Debrid returned an unexpected torrent file selection response.")
+
+    async def delete_torrent(self, torrent_id: str) -> None:
+        response = await self._delete_authenticated(f"torrents/delete/{torrent_id}")
+        if response.status_code == 404:
+            return
+        self._raise_for_unexpected_status(response)
+        if response.status_code != 204:
+            raise UpstreamError("Real-Debrid returned an unexpected torrent delete response.")
+
+    async def _get_authenticated(self, path: str) -> httpx.Response:
+        if not self.settings.realdebrid_api_token:
+            raise ConfigurationError("REALDEBRID_API_TOKEN is not configured.")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            return await client.get(
+                f"{self.settings.realdebrid_api_base_url}/{path}",
+                headers={
+                    "Authorization": f"Bearer {self.settings.realdebrid_api_token}",
+                },
+            )
+
     async def _post_authenticated(
         self,
         path: str,
@@ -569,6 +655,18 @@ class RealDebridClient:
             return await client.post(
                 f"{self.settings.realdebrid_api_base_url}/{path}",
                 data=data,
+                headers={
+                    "Authorization": f"Bearer {self.settings.realdebrid_api_token}",
+                },
+            )
+
+    async def _delete_authenticated(self, path: str) -> httpx.Response:
+        if not self.settings.realdebrid_api_token:
+            raise ConfigurationError("REALDEBRID_API_TOKEN is not configured.")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            return await client.delete(
+                f"{self.settings.realdebrid_api_base_url}/{path}",
                 headers={
                     "Authorization": f"Bearer {self.settings.realdebrid_api_token}",
                 },
@@ -746,14 +844,14 @@ class Downloader:
         self.group_store = GroupStateStore(settings.group_state_file)
 
     async def submit_text(self, submitted_text: str) -> SubmissionResult:
-        urls = extract_urls(submitted_text)
-        if not urls:
+        submissions = extract_urls(submitted_text)
+        if not submissions:
             return SubmissionResult(
                 ok=False,
-                message="Paste at least one valid http:// or https:// URL.",
+                message="Paste at least one valid http://, https://, or magnet:? link.",
                 downloads=[],
             )
-        return await self.submit_urls(urls)
+        return await self.submit_urls(submissions)
 
     async def submit(self, submitted_url: str) -> DownloadResult:
         submission = await self.submit_urls([submitted_url])
@@ -765,13 +863,16 @@ class Downloader:
         results: list[DownloadResult] = []
         for submitted_url in submitted_urls:
             try:
-                results.append(await self._submit_one(submitted_url))
+                results.extend(await self._submit_source(submitted_url))
             except DownloadUnavailableError:
                 results.append(
                     DownloadResult(
                         ok=False,
                         message=NO_DOWNLOAD_MESSAGE,
-                        submitted_hostname=submitted_hostname(submitted_url),
+                        submitted_hostname=(
+                            None if is_magnet_link(submitted_url) else submitted_hostname(submitted_url)
+                        ),
+                        source_label=submitted_source_label(submitted_url),
                     ),
                 )
             except (ConfigurationError, UpstreamError):
@@ -806,9 +907,15 @@ class Downloader:
             downloads=results,
         )
 
-    async def _submit_one(self, submitted_url: str) -> DownloadResult:
+    async def _submit_source(self, submitted_url: str) -> list[DownloadResult]:
+        if is_magnet_link(submitted_url):
+            return await self._submit_magnet(submitted_url)
+        return [await self._submit_hoster_link(submitted_url)]
+
+    async def _submit_hoster_link(self, submitted_url: str) -> DownloadResult:
         self._log_submission(submitted_url)
         host_supported = await self._host_supported(submitted_url)
+        source_label = submitted_source_label(submitted_url)
 
         try:
             await self.realdebrid.check_link(submitted_url)
@@ -817,6 +924,8 @@ class Downloader:
                 ok=False,
                 message=NO_DOWNLOAD_MESSAGE,
                 host_supported=host_supported,
+                submitted_hostname=submitted_hostname(submitted_url),
+                source_label=source_label,
             )
         except (ConfigurationError, UpstreamError):
             raise
@@ -830,6 +939,8 @@ class Downloader:
                 ok=False,
                 message=NO_DOWNLOAD_MESSAGE,
                 host_supported=host_supported,
+                submitted_hostname=submitted_hostname(submitted_url),
+                source_label=source_label,
             )
 
         gid = await self.aria2.add_uri(direct_url)
@@ -844,7 +955,131 @@ class Downloader:
             host_supported=host_supported,
             local_path=local_download_path(self.settings.aria2_download_dir, safe_filename),
             submitted_hostname=submitted_hostname(submitted_url),
+            source_label=source_label,
         )
+
+    async def _submit_magnet(self, magnet_link: str) -> list[DownloadResult]:
+        self._log_submission(magnet_link)
+        source_label = submitted_source_label(magnet_link)
+        added = await self.realdebrid.add_magnet(magnet_link)
+        torrent_id = added.get("id")
+        if not isinstance(torrent_id, str) or not torrent_id:
+            raise DownloadUnavailableError
+
+        files_info = await self._wait_for_torrent_files(torrent_id)
+        if files_info is None:
+            return [
+                DownloadResult(
+                    ok=False,
+                    message=NO_TORRENT_READY_MESSAGE,
+                    source_label=source_label,
+                ),
+            ]
+        if files_info.get("error") == TORRENT_PROCESSING_FAILED_MESSAGE:
+            return [
+                DownloadResult(
+                    ok=False,
+                    message=TORRENT_PROCESSING_FAILED_MESSAGE,
+                    source_label=source_label,
+                ),
+            ]
+
+        await self.realdebrid.select_torrent_files(torrent_id, "all")
+        ready_info = await self._wait_for_torrent_links(torrent_id)
+        if ready_info is None:
+            return [
+                DownloadResult(
+                    ok=False,
+                    message=NO_TORRENT_READY_MESSAGE,
+                    source_label=source_label,
+                ),
+            ]
+        if ready_info.get("error") == TORRENT_PROCESSING_FAILED_MESSAGE:
+            return [
+                DownloadResult(
+                    ok=False,
+                    message=TORRENT_PROCESSING_FAILED_MESSAGE,
+                    source_label=source_label,
+                ),
+            ]
+
+        links = torrent_links(ready_info)
+        if not links:
+            return [
+                DownloadResult(
+                    ok=False,
+                    message=NO_DOWNLOAD_MESSAGE,
+                    source_label=source_label,
+                ),
+            ]
+
+        results: list[DownloadResult] = []
+        for link in links:
+            try:
+                result = await self._submit_torrent_link(link, source_label)
+            except DownloadUnavailableError:
+                result = DownloadResult(
+                    ok=False,
+                    message=NO_DOWNLOAD_MESSAGE,
+                    source_label=source_label,
+                )
+            results.append(result)
+        return results
+
+    async def _submit_torrent_link(self, link: str, source_label: str) -> DownloadResult:
+        unrestricted = await self.realdebrid.unrestrict_link(link)
+        direct_url = unrestricted.get("download")
+        if not isinstance(direct_url, str) or not direct_url.startswith(("http://", "https://")):
+            raise DownloadUnavailableError
+
+        gid = await self.aria2.add_uri(direct_url)
+        filename = unrestricted.get("filename")
+        safe_filename = filename if isinstance(filename, str) else None
+        return DownloadResult(
+            ok=True,
+            message="Torrent file submitted to aria2.",
+            aria2_gid=gid,
+            filename=safe_filename,
+            direct_url=direct_url,
+            local_path=local_download_path(self.settings.aria2_download_dir, safe_filename),
+            source_label=source_label,
+        )
+
+    async def _wait_for_torrent_files(self, torrent_id: str) -> dict[str, Any] | None:
+        return await self._wait_for_torrent(
+            torrent_id,
+            lambda info: bool(torrent_files(info)),
+        )
+
+    async def _wait_for_torrent_links(self, torrent_id: str) -> dict[str, Any] | None:
+        return await self._wait_for_torrent(
+            torrent_id,
+            lambda info: torrent_status(info) == "downloaded" and bool(torrent_links(info)),
+        )
+
+    async def _wait_for_torrent(
+        self,
+        torrent_id: str,
+        is_ready: Any,
+    ) -> dict[str, Any] | None:
+        timeout = max(self.settings.torrent_ready_timeout_seconds, 0)
+        poll_seconds = max(self.settings.torrent_poll_seconds, 0.1)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            info = await self.realdebrid.torrent_info(torrent_id)
+            status = torrent_status(info)
+            if status in TORRENT_ERROR_STATUSES:
+                return {
+                    "status": status,
+                    "links": [],
+                    "error": TORRENT_PROCESSING_FAILED_MESSAGE,
+                }
+            if is_ready(info):
+                return info
+            if asyncio.get_running_loop().time() >= deadline:
+                return None
+            remaining = max(deadline - asyncio.get_running_loop().time(), 0.1)
+            await asyncio.sleep(min(poll_seconds, remaining))
 
     def _create_group(
         self,
@@ -860,7 +1095,7 @@ class Downloader:
         hosts: list[str] = []
         seen_hosts: set[str] = set()
         for submitted_url in submitted_urls:
-            host = submitted_hostname(submitted_url)
+            host = submitted_source_label(submitted_url)
             if host not in seen_hosts:
                 hosts.append(host)
                 seen_hosts.add(host)
@@ -895,6 +1130,9 @@ class Downloader:
         return any(hostname == domain or hostname.endswith(f".{domain}") for domain in domains)
 
     def _log_submission(self, submitted_url: str) -> None:
+        if is_magnet_link(submitted_url):
+            logger.info("Received submitted magnet link")
+            return
         parsed = urlparse(submitted_url)
         host = parsed.hostname or "unknown-host"
         if self.settings.submitted_url_logging:
@@ -1307,9 +1545,29 @@ async def index() -> str:
 async def submit(
     url: str = Form(...),
     downloader: Downloader = Depends(get_downloader),
-) -> str:
+) -> Any:
+    if submission_contains_magnet(url):
+        asyncio.create_task(submit_download_text_in_background(url, downloader))
+        return queue_redirect(
+            "Magnet submission started. The queue will update when Real-Debrid links are ready.",
+            "success",
+        )
     result = await submit_download_text(url, downloader)
     return render_page(result)
+
+
+def submission_contains_magnet(submitted_text: str) -> bool:
+    return any(is_magnet_link(submission) for submission in extract_urls(submitted_text))
+
+
+async def submit_download_text_in_background(submitted_text: str, downloader: Any) -> None:
+    try:
+        result = await submit_download_text(submitted_text, downloader)
+    except Exception as exc:
+        logger.warning("Background magnet submission failed: %s", exc)
+        return
+    if not result.ok:
+        logger.info("Background magnet submission finished without queued downloads: %s", result.message)
 
 
 async def group_monitor_loop(settings: Settings) -> None:
@@ -1557,6 +1815,29 @@ def queue_item_path(payload: dict[str, Any]) -> str | None:
         if isinstance(path, str) and path:
             return path
     return None
+
+
+def torrent_status(payload: dict[str, Any]) -> str:
+    status = payload.get("status")
+    return status if isinstance(status, str) else "unknown"
+
+
+def torrent_files(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    files = payload.get("files")
+    if not isinstance(files, list):
+        return []
+    return [file_payload for file_payload in files if isinstance(file_payload, dict)]
+
+
+def torrent_links(payload: dict[str, Any]) -> list[str]:
+    links = payload.get("links")
+    if not isinstance(links, list):
+        return []
+    return [
+        link
+        for link in links
+        if isinstance(link, str) and link.startswith(("http://", "https://"))
+    ]
 
 
 def parse_int(value: Any) -> int:
