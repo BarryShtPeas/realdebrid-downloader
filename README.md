@@ -158,7 +158,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 Run tests:
 
 ```bash
-pytest
+.venv/bin/python -m pytest -q
 ```
 
 When using `uv` in a restricted container, keep the cache in a writable path:

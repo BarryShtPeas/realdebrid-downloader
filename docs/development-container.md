@@ -51,7 +51,7 @@ A Docker-capable agent development container should include:
 
 - Python 3.12.
 - `uv` and/or `pip`.
-- `pytest`.
+- `pytest` available through the project virtualenv; use `.venv/bin/python -m pytest -q`.
 - Git, OpenSSH client, and GitHub CLI (`gh`).
 - Docker CLI with the Docker Compose plugin.
 - 7-Zip (`7z`) when testing archive extraction outside the app image.
