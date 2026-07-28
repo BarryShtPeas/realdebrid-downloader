@@ -1,10 +1,10 @@
 # Real-Debrid Downloader
 
-Small self-hosted web app for submitting Real-Debrid-supported hoster links and handing the unrestricted download URL to an internal aria2 downloader.
+Small self-hosted web app for submitting Real-Debrid-supported hoster links or magnet links and handing the generated download URLs to an internal aria2 downloader.
 
 ## Purpose
 
-This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs. Paste a link, and the app unrestricts it through Real-Debrid and hands the direct download to an internal aria2 worker. It is a lightweight, always-on alternative to keeping a full desktop download manager running.
+This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs plus magnet links. Paste a single link or free text containing multiple links, and the app extracts submissions, resolves them through Real-Debrid, and hands the direct downloads to an internal aria2 worker. Multipart archive and torrent submissions are tracked as one group and extracted automatically after all parts complete.
 
 The runtime model is:
 
@@ -15,12 +15,21 @@ The runtime model is:
 
 ## Download Flow
 
-1. The operator submits a hoster URL.
+1. The operator submits a hoster URL, magnet link, or free text containing multiple links.
 2. The app checks Real-Debrid supported hosts through `/hosts/domains` when that metadata is available.
 3. The app calls `/unrestrict/check` to check whether Real-Debrid currently has a downloadable file for that link.
 4. The app calls `/unrestrict/link` with the submitted URL.
 5. If Real-Debrid returns a generated direct download URL, the app submits it to aria2 using JSON-RPC.
-6. aria2 downloads the file to `/downloads`.
+6. The web UI shows the filename, aria2 id, and generated Real-Debrid direct download URL.
+7. aria2 downloads the file to `/downloads`.
+
+For magnet links, the app calls `/torrents/addMagnet`, waits for torrent file metadata, selects all files with `/torrents/selectFiles/{id}`, then polls `/torrents/info/{id}` until Real-Debrid returns downloadable links or the configured timeout expires. Each returned torrent link is unrestricted through `/unrestrict/link` and submitted to aria2 as a normal download. Web-form magnet submissions redirect to the queue immediately while this Real-Debrid handoff continues in the background; API submissions keep returning a synchronous JSON result.
+
+When multiple links are pasted, the app preserves the first occurrence of each exact hoster URL or magnet link and submits each independently. Submitted multipart parts and torrent files are stored as one group in `/config/download-groups.json` by default. The group state stores original hostnames or the generic `magnet link` label, aria2 ids, filenames, local paths, status, and extraction state; it does not store full submitted URLs or magnet hashes.
+
+The app polls aria2 for tracked groups every 30 seconds by default. After every part in a group reaches `complete`, it looks for a supported archive start file, preferring `.part1.rar`, then `.rar`, `.zip`, and `.7z`. Extraction runs with 7-Zip into `/downloads/<group-name>/`. Archive part files are deleted only after extraction succeeds; failed extraction leaves archive files in place and marks the group failed. Completed non-archive downloads, such as `.dmg` files, are marked `skipped` for extraction and are left in place.
+
+The queue page also opens a browser-local Server-Sent Events stream to refresh queue and multipart group progress every second by default. The stream contains only rendered queue HTML from sanitized aria2 and app metadata; it does not expose the aria2 RPC URL, aria2 RPC secret, submitted URLs, or Real-Debrid API token.
 
 If supported-host data is unavailable or inconclusive, the app still attempts the unrestrict step. When Real-Debrid cannot produce a usable download URL, the web UI shows this user-facing message:
 
@@ -44,6 +53,9 @@ Relevant endpoints for the initial implementation:
 | `GET /hosts`, `GET /hosts/status`, `GET /hosts/regex` | Optional supported-host and matching metadata. |
 | `POST /unrestrict/check` | Check whether a hoster link is currently downloadable. |
 | `POST /unrestrict/link` | Generate an unrestricted direct download URL. |
+| `POST /torrents/addMagnet` | Add a magnet link to Real-Debrid. |
+| `GET /torrents/info/{id}` | Read torrent file, status, and generated link metadata. |
+| `POST /torrents/selectFiles/{id}` | Select torrent files; RDD selects `all` for v1. |
 
 Most Real-Debrid endpoints require authentication. Do not include `REALDEBRID_API_TOKEN` in logs, rendered pages, screenshots, examples, or issue text.
 
@@ -61,13 +73,87 @@ Copy `.env.example` to `.env` for local development and fill in only local secre
 | `APP_DOWNLOAD_DIR` | no | `/downloads` | Container path shared with aria2. |
 | `APP_CONFIG_DIR` | no | `/config` | Persistent state/config path. |
 | `APP_SUBMITTED_URL_LOGGING` | no | `false` | Keep false unless debugging with redaction. |
+| `APP_GROUP_STATE_FILE` | no | `/config/download-groups.json` | Persistent multipart group state file. |
+| `APP_EXTRACT_TIMEOUT_SECONDS` | no | `7200` | Maximum 7-Zip extraction time per group. |
+| `APP_GROUP_POLL_SECONDS` | no | `30` | aria2 polling interval for tracked multipart groups. Set to `0` to disable the background poller. |
+| `APP_QUEUE_STREAM_INTERVAL_SECONDS` | no | `1` | Server-Sent Events refresh interval for the `/queue` page. |
+| `APP_TORRENT_POLL_SECONDS` | no | `5` | Poll interval while waiting for Real-Debrid magnet metadata and generated torrent links. |
+| `APP_TORRENT_READY_TIMEOUT_SECONDS` | no | `900` | Maximum synchronous wait for a submitted magnet to become downloadable. |
 | `ARIA2_RPC_URL` | yes | `http://rd-aria2:6800/jsonrpc` | Internal aria2 JSON-RPC URL. |
 | `ARIA2_RPC_SECRET` | recommended | none | aria2 RPC token. |
 | `ARIA2_DOWNLOAD_DIR` | no | `/downloads` | Directory passed to aria2. |
 | `ARIA2_MAX_CONNECTION_PER_SERVER` | no | `8` | aria2 connection tuning. |
 | `ARIA2_SPLIT` | no | `8` | aria2 split tuning. |
 
+## Queue Management
+
+Open `/queue` to view and manage the internal aria2 queue. The page is server-rendered for initial load and no-JavaScript fallback. When JavaScript is available, it connects to `/queue/events` with Server-Sent Events and refreshes the queue sections without a manual page reload. All aria2 JSON-RPC calls still happen from the app container, so the aria2 RPC endpoint and RPC secret are not exposed to the browser.
+
+The queue page shows:
+
+- Multipart groups, including aggregate progress, part status, and extraction status.
+- Active downloads.
+- Waiting or paused downloads.
+- Recently stopped, completed, removed, or failed downloads.
+
+Supported controls:
+
+- Pause, resume, and remove active/waiting downloads.
+- Move waiting or paused downloads to the top, up, down, or bottom.
+- Clear individual stopped history entries.
+- Clear all stopped history entries.
+- Clear eligible multipart group history entries individually.
+- Clear all eligible multipart group history entries.
+
+Multipart group clearing removes only persisted app metadata from `/config/download-groups.json`; it never deletes archive files, extracted files, or `/downloads` contents. A group can be cleared only after all tracked parts are in terminal aria2 states such as `complete`, `error`, or `removed`, or after extraction is marked `complete`, `failed`, or `skipped`. Active, waiting, paused, submitted, pending, or extracting groups remain visible and cannot be cleared.
+
+Queue actions redirect back to `/queue`. Live updates resume after the redirect.
+
+## API and Swagger
+
+RDD exposes a JSON API for integrations such as browser extensions:
+
+- `GET /api/version` returns the app name and semantic version.
+- `POST /api/submit` accepts `{"url": "..."}` where the value can be one hoster URL, one magnet link, or free text containing multiple links.
+- `GET /api/queue` returns sanitized queue and multipart group state.
+- `POST /api/queue/{gid}/pause`, `/resume`, `/remove`, and `/clear` control aria2 queue entries.
+- `POST /api/queue/clear-stopped` clears aria2 stopped history.
+- `POST /api/queue/groups/{group_id}/clear` and `/api/queue/groups/clear` clear eligible multipart group metadata.
+
+Swagger UI is available at `/docs`, and the OpenAPI definition is available at `/openapi.json`. UI-only routes such as `/submit`, `/queue/events`, and redirect-based queue controls are intentionally excluded from the API schema.
+
+API responses are sanitized for clients. They include useful status, filename, progress, group, aria2 id, and submitted hostnames for hoster links, but they do not include Real-Debrid tokens, aria2 RPC details, submitted full URLs, magnet links, magnet hashes, generated direct Real-Debrid URLs, or local download paths.
+
+## Firefox Extension
+
+An unpacked local Firefox WebExtension is available in `extensions/firefox-rdd`.
+It adds context-menu actions for sending links or selected text to an RDD
+instance through `POST /api/submit`, and it tests connectivity with
+`GET /api/version`.
+
+The extension stores only the configured RDD base URL in Firefox extension
+storage. It does not store Real-Debrid tokens, aria2 RPC secrets, submitted
+URLs, or cookies.
+
 ## Local Development
+
+Required local tooling:
+
+- Python 3.12.
+- `pip`, or `uv` when Python is not installed in the development container.
+- Docker with the Compose plugin for running the full app plus aria2 stack.
+- 7-Zip (`7z`) only when testing archive extraction outside the app Docker image.
+
+The production app image installs Python dependencies and 7-Zip through the
+`Dockerfile`. Agent or LLM helper containers are development infrastructure, not
+the app runtime image. If an agent container needs to build images or run
+Compose, it must have Docker CLI tooling, the Compose plugin, access to a Docker
+daemon, and repository mounts that resolve the same way for the host Docker
+daemon. See [Remote Agent Development Container](docs/development-container.md).
+The checked-in `.devcontainer/` setup provides a generic agent/dev image for
+that workflow without changing the production app image.
+
+Python-only development loop:
 
 ```bash
 python3 -m venv .venv
@@ -79,7 +165,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 Run tests:
 
 ```bash
-pytest
+.venv/bin/python -m pytest -q
+```
+
+When using `uv` in a restricted container, keep the cache in a writable path:
+
+```bash
+UV_CACHE_DIR="$PWD/.uv-cache" uv venv --python 3.12
+UV_CACHE_DIR="$PWD/.uv-cache" uv pip install -r requirements-dev.txt --python .venv/bin/python
+.venv/bin/python -m pytest
+```
+
+Full Docker development loop:
+
+```bash
+docker version
+docker compose version
+docker compose -f compose.example.yml config
 ```
 
 Run the app with aria2:
@@ -96,11 +198,26 @@ GitHub Actions publishes the public image to:
 ghcr.io/barryshtpeas/realdebrid-downloader
 ```
 
-Expected tags:
+Production tags:
 
 - `latest` from the default branch.
 - Branch/SHA tags for traceable builds.
 - Release tag names when a Git tag is pushed.
+
+The app version uses `major.minor.bugfix` semantic versioning and is defined in `app/__init__.py`. Release tags should use `vX.Y.Z` and match the app version displayed in the web UI and `/api/version`.
+
+Development tags are published by the `Build and publish dev container`
+GitHub Actions workflow when changes are pushed to `dev`, or when the workflow is
+run manually:
+
+- `dev` for the latest manually published development image.
+- `dev-<shortsha>` for a pinned development image built from a specific commit.
+
+To publish a dev image, merge or push the change to `dev`. For an ad hoc build,
+open GitHub Actions, run `Build and publish dev container`, and set `ref` to a
+branch, tag, or SHA. Deploy `ghcr.io/barryshtpeas/realdebrid-downloader:dev` for
+quick testing, or use the matching `dev-<shortsha>` tag when you want a
+rollback-safe pinned image. The dev workflow never updates `latest`.
 
 Run the image directly:
 
@@ -128,7 +245,7 @@ Then open `http://localhost:8080`.
 
 ### Mapping your host download directory
 
-aria2 writes completed files to `/downloads` inside the container. Point that at any host directory with `DOWNLOAD_DIR` in `.env`:
+aria2 writes completed files to `/downloads` inside the container, and the app container also mounts that path so it can extract completed archive groups. Point that at any host directory with `DOWNLOAD_DIR` in `.env`:
 
 ```env
 DOWNLOAD_DIR=/mnt/media/downloads
@@ -150,13 +267,17 @@ To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, ngi
 
 - Never commit real Real-Debrid or GitHub tokens.
 - Never log full submitted URLs by default. The app logs only the submitted URL hostname, and the optional diagnostic flag still redacts path and query material.
-- Treat submitted URLs as private operator data.
+- Magnet submissions are logged only as a generic magnet-link event.
+- Multipart group state stores only original hostnames or a generic magnet label and operational aria2/file metadata, not full submitted URLs or magnet hashes.
+- Treat submitted URLs and magnet links as private operator data.
+- The submit result page displays the generated Real-Debrid direct download URL in the browser UI. Protect the app route accordingly.
 - Keep aria2 JSON-RPC internal to the Docker network.
+- Queue controls can pause, resume, remove, and reorder downloads. Do not expose this app publicly without access control.
 - Do not expose `/downloads` through the web app unless an explicit authenticated browsing feature is added later.
 
 ## Implementation Status
 
-The production Real-Debrid and aria2 workflow is implemented in `app/main.py` with mocked tests for Real-Debrid and aria2 responses. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
+The production Real-Debrid hoster/torrent, aria2, multipart group tracking, and automatic extraction workflow is implemented in `app/main.py` with mocked tests for Real-Debrid, aria2, persistence, and extraction responses. Server-rendered UI helpers live in `app/views.py`, and shared page styling and queue-page JavaScript live in `app/static/`. The default test suite does not require a live Real-Debrid account, aria2 instance, or API token.
 
 ## Licence
 

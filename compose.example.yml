@@ -22,6 +22,7 @@ services:
       - "8080:8080"
     volumes:
       - ${CONFIG_DIR:-./config}:/config
+      - ${DOWNLOAD_DIR:-./downloads}:/downloads
     depends_on:
       - rd-aria2
     restart: unless-stopped
