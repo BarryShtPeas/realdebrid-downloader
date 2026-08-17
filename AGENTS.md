@@ -8,7 +8,8 @@ This repository is the standalone, self-hostable source for the Real-Debrid down
 - Start standalone app behavior, tests, and extension work in this repo.
 - If the request may also require Grace Compose wiring, Traefik routes, image tags, deployment docs, monitoring, or repo instruction changes, create a task workspace before editing:
   `cd /mnt/cache/repos/home-ops-docs && scripts/grace-task-worktree.sh <task-slug> realdebrid-downloader unraid home-ops-docs`.
-- Continue active cross-repo work from `/mnt/cache/worktrees/<task-slug>/realdebrid-downloader`; keep `/mnt/cache/repos/realdebrid-downloader` clean as the canonical checkout.
+- If worktree creation fails with `Read-only file system` or sandbox permission errors, rerun the same helper command with sandbox escalation/approval; do not switch to an app-managed handoff worktree solely for that failure.
+- Continue active cross-repo work from `/mnt/cache/repos/.worktrees/<task-slug>/realdebrid-downloader`; keep `/mnt/cache/repos/realdebrid-downloader` clean as the canonical checkout.
 - If app work started in the canonical checkout becomes cross-repo, stop before more edits and move or commit the current task changes into a task workspace.
 
 ## Maintenance Rules
