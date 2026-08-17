@@ -2,6 +2,15 @@
 
 This repository is the standalone, self-hostable source for the Real-Debrid downloader web app. Keep it deployable as a Docker image with no dependency on any private infrastructure.
 
+## Grace Task Workspace Guard
+
+- At task start, run `/mnt/cache/repos/home-ops-docs/scripts/grace-estate-status.sh` when available so dirty Grace repo state is visible before edits.
+- Start standalone app behavior, tests, and extension work in this repo.
+- If the request may also require Grace Compose wiring, Traefik routes, image tags, deployment docs, monitoring, or repo instruction changes, create a task workspace before editing:
+  `cd /mnt/cache/repos/home-ops-docs && scripts/grace-task-worktree.sh <task-slug> realdebrid-downloader unraid home-ops-docs`.
+- Continue active cross-repo work from `/mnt/cache/worktrees/<task-slug>/realdebrid-downloader`; keep `/mnt/cache/repos/realdebrid-downloader` clean as the canonical checkout.
+- If app work started in the canonical checkout becomes cross-repo, stop before more edits and move or commit the current task changes into a task workspace.
+
 ## Maintenance Rules
 
 - Keep the app repo standalone: source, tests, Dockerfile, compose example, and image-publishing workflow all live here.
