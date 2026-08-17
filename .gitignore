@@ -12,4 +12,7 @@ htmlcov/
 .DS_Store
 dist/
 build/
+extensions.locked/
+extensions/firefox-rdd/node_modules/
+extensions/firefox-rdd/web-ext-artifacts/
 AGENTS.local.md

@@ -1,10 +1,10 @@
 # Real-Debrid Downloader
 
-Small self-hosted web app for submitting Real-Debrid-supported hoster links or magnet links and handing the generated download URLs to an internal aria2 downloader.
+Small self-hosted web app for playing Real-Debrid streamable hoster links in the browser or submitting Real-Debrid-supported hoster links and magnet links to an internal aria2 downloader.
 
 ## Purpose
 
-This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs plus magnet links. Paste a single link or free text containing multiple links, and the app extracts submissions, resolves them through Real-Debrid, and hands the direct downloads to an internal aria2 worker. Multipart archive and torrent submissions are tracked as one group and extracted automatically after all parts complete.
+This app provides a simple web form for Rapidgator and other Real-Debrid-supported hoster URLs plus magnet links. Paste a single hoster link and choose Play to resolve it through Real-Debrid and stream it through an embedded browser video player. Choose Download to extract one or more submissions from the pasted text, resolve them through Real-Debrid, and hand the direct downloads to an internal aria2 worker. Multipart archive and torrent submissions are tracked as one group and extracted automatically after all parts complete.
 
 The runtime model is:
 
@@ -15,13 +15,28 @@ The runtime model is:
 
 ## Download Flow
 
-1. The operator submits a hoster URL, magnet link, or free text containing multiple links.
+1. The operator submits a hoster URL, magnet link, or free text containing multiple links and chooses Download.
 2. The app checks Real-Debrid supported hosts through `/hosts/domains` when that metadata is available.
 3. The app calls `/unrestrict/check` to check whether Real-Debrid currently has a downloadable file for that link.
 4. The app calls `/unrestrict/link` with the submitted URL.
 5. If Real-Debrid returns a generated direct download URL, the app submits it to aria2 using JSON-RPC.
 6. The web UI shows the filename, aria2 id, and generated Real-Debrid direct download URL.
 7. aria2 downloads the file to `/downloads`.
+
+## Play Flow
+
+The submit page also has a Play action for a single streamable hoster URL:
+
+1. The operator pastes one `http://` or `https://` hoster URL and chooses Play.
+2. The app checks supported-host metadata and `/unrestrict/check` the same way as the download flow.
+3. The app calls `/unrestrict/link` but does not submit the generated direct URL to aria2.
+4. If Real-Debrid returns a usable direct URL and does not explicitly mark the file as non-streamable, the app creates a short-lived in-memory playback session.
+5. The page renders an HTML5 `<video>` player pointing at a local `/play/{session}/stream` URL.
+6. The app proxies the Real-Debrid stream to the browser and forwards browser `Range` requests so seeking can work when Real-Debrid supports it.
+
+Play v1 intentionally supports only one hoster URL at a time. Magnet links, multipart archive sets, and pasted blocks containing multiple links remain download-only. If Real-Debrid does not return a direct URL, the app shows the same no-download message used by the download flow. If Real-Debrid marks a file as not streamable, the UI offers a clear playback error and the operator can use Download instead.
+
+Playback sessions are process-local and expire automatically. They are not persisted to `/config`, and the app does not render generated Real-Debrid direct URLs in the Play page or JSON API responses.
 
 For magnet links, the app calls `/torrents/addMagnet`, waits for torrent file metadata, selects all files with `/torrents/selectFiles/{id}`, then polls `/torrents/info/{id}` until Real-Debrid returns downloadable links or the configured timeout expires. Each returned torrent link is unrestricted through `/unrestrict/link` and submitted to aria2 as a normal download. Web-form magnet submissions redirect to the queue immediately while this Real-Debrid handoff continues in the background; API submissions keep returning a synchronous JSON result.
 
@@ -53,6 +68,8 @@ Relevant endpoints for the initial implementation:
 | `GET /hosts`, `GET /hosts/status`, `GET /hosts/regex` | Optional supported-host and matching metadata. |
 | `POST /unrestrict/check` | Check whether a hoster link is currently downloadable. |
 | `POST /unrestrict/link` | Generate an unrestricted direct download URL. |
+| `GET /streaming/transcode/{id}` | Future option for Real-Debrid transcoding links; not used by Play v1. |
+| `GET /streaming/mediaInfos/{id}` | Future option for media metadata; not used by Play v1. |
 | `POST /torrents/addMagnet` | Add a magnet link to Real-Debrid. |
 | `GET /torrents/info/{id}` | Read torrent file, status, and generated link metadata. |
 | `POST /torrents/selectFiles/{id}` | Select torrent files; RDD selects `all` for v1. |
@@ -83,11 +100,14 @@ Copy `.env.example` to `.env` for local development and fill in only local secre
 | `ARIA2_RPC_SECRET` | recommended | none | aria2 RPC token. |
 | `ARIA2_DOWNLOAD_DIR` | no | `/downloads` | Directory passed to aria2. |
 | `ARIA2_MAX_CONNECTION_PER_SERVER` | no | `8` | aria2 connection tuning. |
+| `ARIA2_MAX_CONCURRENT_DOWNLOADS` | no | `1` | Maximum active aria2 downloads. Values are clamped from `1` to `3`. |
 | `ARIA2_SPLIT` | no | `8` | aria2 split tuning. |
 
 ## Queue Management
 
 Open `/queue` to view and manage the internal aria2 queue. The page is server-rendered for initial load and no-JavaScript fallback. When JavaScript is available, it connects to `/queue/events` with Server-Sent Events and refreshes the queue sections without a manual page reload. All aria2 JSON-RPC calls still happen from the app container, so the aria2 RPC endpoint and RPC secret are not exposed to the browser.
+
+The app configures aria2 with `ARIA2_MAX_CONCURRENT_DOWNLOADS` on startup and before new downloads are submitted. The default is one active download at a time, and self-hosters can raise it to two or three concurrent downloads.
 
 The queue page shows:
 
@@ -99,13 +119,14 @@ The queue page shows:
 Supported controls:
 
 - Pause, resume, and remove active/waiting downloads.
-- Move waiting or paused downloads to the top, up, down, or bottom.
+- Drag waiting or paused downloads to reprioritise them when JavaScript is available.
+- Move waiting or paused downloads to the top, up, down, or bottom without JavaScript.
 - Clear individual stopped history entries.
 - Clear all stopped history entries.
 - Clear eligible multipart group history entries individually.
 - Clear all eligible multipart group history entries.
 
-Multipart group clearing removes only persisted app metadata from `/config/download-groups.json`; it never deletes archive files, extracted files, or `/downloads` contents. A group can be cleared only after all tracked parts are in terminal aria2 states such as `complete`, `error`, or `removed`, or after extraction is marked `complete`, `failed`, or `skipped`. Active, waiting, paused, submitted, pending, or extracting groups remain visible and cannot be cleared.
+Multipart group clearing removes only persisted app metadata from `/config/download-groups.json`; it never deletes archive files, extracted files, aria2 queue entries, or `/downloads` contents. Any visible multipart group can be cleared, including stale `submitted` or `pending` groups left behind after an interrupted Real-Debrid or aria2 handoff.
 
 Queue actions redirect back to `/queue`. Live updates resume after the redirect.
 
@@ -117,6 +138,7 @@ RDD exposes a JSON API for integrations such as browser extensions:
 - `POST /api/submit` accepts `{"url": "..."}` where the value can be one hoster URL, one magnet link, or free text containing multiple links.
 - `GET /api/queue` returns sanitized queue and multipart group state.
 - `POST /api/queue/{gid}/pause`, `/resume`, `/remove`, and `/clear` control aria2 queue entries.
+- `POST /api/queue/{gid}/move` accepts `{"position": 0}` to move a waiting or paused item to a zero-based queue position.
 - `POST /api/queue/clear-stopped` clears aria2 stopped history.
 - `POST /api/queue/groups/{group_id}/clear` and `/api/queue/groups/clear` clear eligible multipart group metadata.
 
@@ -134,6 +156,17 @@ instance through `POST /api/submit`, and it tests connectivity with
 The extension stores only the configured RDD base URL in Firefox extension
 storage. It does not store Real-Debrid tokens, aria2 RPC secrets, submitted
 URLs, or cookies.
+
+The extension is also prepared for signed, self-distributed Firefox installs.
+From `extensions/firefox-rdd`, run `npm install`, `npm run lint`, and
+`npm run build` to validate and package it. To produce a Mozilla-signed unlisted
+XPI, set `WEB_EXT_API_KEY` and `WEB_EXT_API_SECRET` from the Mozilla Developer
+Hub and run `npm run sign`. Keep the extension version in
+`extensions/firefox-rdd/manifest.json` matched to `app/__init__.py` before
+signing a release.
+
+Use the extension only with an RDD instance that is local, VPN-only, or protected
+by a reverse proxy. The extension does not add authentication to the RDD API.
 
 ## Local Development
 
@@ -271,6 +304,7 @@ To serve the app on a domain, put it behind a reverse proxy (Traefik, Caddy, ngi
 - Multipart group state stores only original hostnames or a generic magnet label and operational aria2/file metadata, not full submitted URLs or magnet hashes.
 - Treat submitted URLs and magnet links as private operator data.
 - The submit result page displays the generated Real-Debrid direct download URL in the browser UI. Protect the app route accordingly.
+- The Play feature streams generated Real-Debrid media through the app container. Anyone with access to the app can start playback for links they submit, and app/proxy bandwidth carries the stream. Protect the app route accordingly.
 - Keep aria2 JSON-RPC internal to the Docker network.
 - Queue controls can pause, resume, remove, and reorder downloads. Do not expose this app publicly without access control.
 - Do not expose `/downloads` through the web app unless an explicit authenticated browsing feature is added later.

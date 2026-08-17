@@ -35,6 +35,10 @@
   box-sizing: border-box;
 }
 
+html {
+  overflow-x: hidden;
+}
+
 body {
   background: var(--bg);
   color: var(--fg);
@@ -42,19 +46,25 @@ body {
   line-height: 1.5;
   margin: 0;
   min-height: 100vh;
+  overflow-x: hidden;
   padding: 3rem 1rem;
+  width: 100%;
 }
 
 main {
   margin: 0 auto;
+  min-width: 0;
+  width: 100%;
 }
 
 .submit-page {
   max-width: 42rem;
+  width: min(100%, 42rem);
 }
 
 .queue-page {
   max-width: 62rem;
+  width: min(100%, 62rem);
 }
 
 h1 {
@@ -143,6 +153,12 @@ button {
   width: 100%;
 }
 
+.submit-actions {
+  display: grid;
+  gap: .75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 button.danger {
   background: var(--danger);
   color: #ffffff;
@@ -173,6 +189,27 @@ button.danger {
   color: var(--error-fg);
 }
 
+.player {
+  background: #000000;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin: 0 0 1.25rem;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  width: 100%;
+}
+
+.player video {
+  aspect-ratio: 16 / 9;
+  display: block;
+  height: auto;
+  max-width: 100%;
+  min-width: 0;
+  object-fit: contain;
+  width: 100%;
+}
+
 .section-heading {
   align-items: center;
   justify-content: space-between;
@@ -186,10 +223,36 @@ button.danger {
   padding: 1rem;
 }
 
+.queue-item.reorderable {
+  cursor: grab;
+}
+
+.queue-item.dragging {
+  opacity: .55;
+}
+
+.item-title {
+  align-items: flex-start;
+  display: flex;
+  gap: .65rem;
+  min-width: 0;
+}
+
 .item h3 {
   font-size: 1rem;
   margin: 0 0 .65rem;
   overflow-wrap: anywhere;
+}
+
+.item-title h3 {
+  flex: 1;
+  min-width: 0;
+}
+
+.drag-handle {
+  flex: 0 0 auto;
+  min-height: 2rem;
+  padding: .35rem .6rem;
 }
 
 .parts {
@@ -231,4 +294,14 @@ button.danger {
   color: var(--muted);
   font-size: .9rem;
   margin-top: 1.25rem;
+}
+
+@media (max-width: 34rem) {
+  body {
+    padding: 1.5rem .75rem;
+  }
+
+  .submit-actions {
+    grid-template-columns: 1fr;
+  }
 }

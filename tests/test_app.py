@@ -28,8 +28,10 @@ from app.main import (
 @pytest.fixture(autouse=True)
 def clear_dependency_overrides() -> None:
     app.dependency_overrides.clear()
+    main.PLAY_SESSIONS.clear()
     yield
     app.dependency_overrides.clear()
+    main.PLAY_SESSIONS.clear()
 
 
 def test_healthz() -> None:
@@ -81,6 +83,23 @@ def test_api_version_and_pages_include_app_version() -> None:
     anyio.run(run_test)
 
 
+def test_settings_clamps_aria2_max_concurrent_downloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ARIA2_MAX_CONCURRENT_DOWNLOADS", raising=False)
+    assert Settings.from_env().aria2_max_concurrent_downloads == 1
+
+    monkeypatch.setenv("ARIA2_MAX_CONCURRENT_DOWNLOADS", "2")
+    assert Settings.from_env().aria2_max_concurrent_downloads == 2
+
+    monkeypatch.setenv("ARIA2_MAX_CONCURRENT_DOWNLOADS", "invalid")
+    assert Settings.from_env().aria2_max_concurrent_downloads == 1
+
+    monkeypatch.setenv("ARIA2_MAX_CONCURRENT_DOWNLOADS", "0")
+    assert Settings.from_env().aria2_max_concurrent_downloads == 1
+
+    monkeypatch.setenv("ARIA2_MAX_CONCURRENT_DOWNLOADS", "9")
+    assert Settings.from_env().aria2_max_concurrent_downloads == 3
+
+
 def test_firefox_extension_manifest_matches_app_version() -> None:
     manifest_path = Path("extensions/firefox-rdd/manifest.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -91,8 +110,31 @@ def test_firefox_extension_manifest_matches_app_version() -> None:
     assert manifest["browser_specific_settings"]["gecko"]["id"] == "rdd-sender@realdebrid-downloader.local"
     assert set(manifest["permissions"]) == {"menus", "notifications", "storage"}
     assert manifest["optional_host_permissions"] == ["http://*/*", "https://*/*"]
+    assert "host_permissions" not in manifest
+    assert manifest["icons"] == {"48": "icon.svg", "96": "icon.svg"}
     assert manifest["background"]["scripts"] == ["background.js"]
     assert manifest["options_ui"]["page"] == "options.html"
+    assert manifest["action"]["default_icon"] == {"48": "icon.svg", "96": "icon.svg"}
+
+
+def test_firefox_extension_has_self_distribution_release_tooling() -> None:
+    extension_root = Path("extensions/firefox-rdd")
+    package = json.loads((extension_root / "package.json").read_text(encoding="utf-8"))
+    readme = (extension_root / "README.md").read_text(encoding="utf-8")
+    gitignore = Path(".gitignore").read_text(encoding="utf-8")
+
+    assert package["private"] is True
+    assert package["version"] == main.__version__
+    assert package["devDependencies"]["web-ext"].startswith("^8.")
+    assert "web-ext lint" in package["scripts"]["lint"]
+    assert "web-ext build" in package["scripts"]["build"]
+    assert "web-ext sign" in package["scripts"]["sign"]
+    assert "--channel unlisted" in package["scripts"]["sign"]
+    assert "WEB_EXT_API_KEY" in readme
+    assert "WEB_EXT_API_SECRET" in readme
+    assert "Install Add-on From File" in readme
+    assert "app/__init__.py" in readme
+    assert "extensions/firefox-rdd/web-ext-artifacts/" in gitignore
 
 
 def test_firefox_extension_uses_rdd_api_without_private_defaults() -> None:
@@ -212,6 +254,311 @@ def test_submit_shows_required_no_download_message() -> None:
         response_text = await main.submit("https://example.com/file", FakeDownloader())  # type: ignore[arg-type]
 
         assert NO_DOWNLOAD_MESSAGE in response_text
+
+    anyio.run(run_test)
+
+
+def test_play_resolves_hoster_link_without_aria2(tmp_path: Any) -> None:
+    async def run_test() -> None:
+        settings = make_settings(group_state_file=str(tmp_path / "groups.json"))
+        downloader = Downloader(settings)
+        calls: list[str] = []
+
+        class FakeRealDebrid:
+            async def supported_domains(self) -> set[str]:
+                calls.append("supported_domains")
+                return {"rapidgator.example"}
+
+            async def check_link(self, submitted_url: str) -> dict[str, Any]:
+                calls.append("check_link")
+                return {"supported": 1}
+
+            async def unrestrict_link(self, submitted_url: str) -> dict[str, Any]:
+                calls.append("unrestrict_link")
+                return {
+                    "id": "rd-file-1",
+                    "download": "https://download.example/movie.mp4?token=rd-secret",
+                    "filename": "movie.mp4",
+                    "mimeType": "video/mp4",
+                    "streamable": 1,
+                }
+
+        class FakeAria2:
+            async def add_uri(self, direct_url: str) -> str:
+                raise AssertionError("play must not submit to aria2")
+
+        downloader.realdebrid = FakeRealDebrid()  # type: ignore[assignment]
+        downloader.aria2 = FakeAria2()  # type: ignore[assignment]
+
+        result = await downloader.prepare_play("https://rapidgator.example/movie.mp4")
+
+        assert result.ok is True
+        assert result.filename == "movie.mp4"
+        assert result.mime_type == "video/mp4"
+        assert result.realdebrid_id == "rd-file-1"
+        assert result.direct_url == "https://download.example/movie.mp4?token=rd-secret"
+        assert calls == ["supported_domains", "check_link", "unrestrict_link"]
+        assert not Path(settings.group_state_file).exists()
+
+    anyio.run(run_test)
+
+
+def test_play_page_renders_local_video_without_leaking_urls() -> None:
+    submitted_url = "https://rapidgator.example/private/movie.mp4?token=submitted-secret"
+    direct_url = "https://download.example/movie.mp4?token=rd-secret"
+
+    class FakeDownloader:
+        async def prepare_play(self, text: str) -> main.PlayResult:
+            assert text == submitted_url
+            return main.PlayResult(
+                ok=True,
+                message="Ready to play.",
+                filename="movie.mp4",
+                direct_url=direct_url,
+                mime_type="video/mp4",
+                streamable=True,
+                submitted_hostname="rapidgator.example",
+            )
+
+    async def run_test() -> None:
+        app.dependency_overrides[get_downloader] = dependency_override(FakeDownloader())
+        async with app_client() as client:
+            response = await client.post("/play", data={"url": submitted_url})
+
+        assert response.status_code == 200
+        assert "<video" in response.text
+        assert '<source src="/play/' in response.text
+        assert "/stream" in response.text
+        assert "movie.mp4" in response.text
+        assert submitted_url not in response.text
+        assert "submitted-secret" not in response.text
+        assert direct_url not in response.text
+        assert "rd-secret" not in response.text
+        assert len(main.PLAY_SESSIONS) == 1
+
+    anyio.run(run_test)
+
+
+def test_play_rejects_multi_link_and_magnet_submissions() -> None:
+    async def run_test() -> None:
+        async with app_client() as client:
+            multi = await client.post(
+                "/play",
+                data={
+                    "url": (
+                        "https://rapidgator.example/one.mp4\n"
+                        "https://rapidgator.example/two.mp4"
+                    ),
+                },
+            )
+            magnet = await client.post(
+                "/play",
+                data={"url": "magnet:?xt=urn:btih:SECRET_HASH&dn=movie"},
+            )
+
+        assert multi.status_code == 200
+        assert main.PLAY_MULTI_LINK_MESSAGE in multi.text
+        assert magnet.status_code == 200
+        assert main.PLAY_MAGNET_MESSAGE in magnet.text
+        assert "SECRET_HASH" not in magnet.text
+        assert not main.PLAY_SESSIONS
+
+    anyio.run(run_test)
+
+
+def test_play_returns_no_download_when_unrestrict_has_no_url() -> None:
+    async def run_test() -> None:
+        downloader = Downloader(make_settings())
+
+        class FakeRealDebrid:
+            async def supported_domains(self) -> set[str]:
+                return {"rapidgator.example"}
+
+            async def check_link(self, submitted_url: str) -> dict[str, Any]:
+                return {"supported": 1}
+
+            async def unrestrict_link(self, submitted_url: str) -> dict[str, Any]:
+                return {"filename": "missing.mp4", "streamable": 1}
+
+        class FakeAria2:
+            async def add_uri(self, direct_url: str) -> str:
+                raise AssertionError("play must not submit to aria2")
+
+        downloader.realdebrid = FakeRealDebrid()  # type: ignore[assignment]
+        downloader.aria2 = FakeAria2()  # type: ignore[assignment]
+
+        result = await downloader.prepare_play("https://rapidgator.example/missing.mp4")
+
+        assert result.ok is False
+        assert result.message == NO_DOWNLOAD_MESSAGE
+
+    anyio.run(run_test)
+
+
+def test_play_stream_proxies_range_and_media_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_test() -> None:
+        main.PLAY_SESSIONS["session-1"] = main.PlaySession(
+            id="session-1",
+            direct_url="https://download.example/movie.mp4?token=rd-secret",
+            filename="movie.mp4",
+            mime_type="video/mp4",
+            created_at=main.time.monotonic(),
+        )
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            assert request.headers["range"] == "bytes=0-99"
+            return httpx.Response(
+                206,
+                content=b"video-bytes",
+                headers={
+                    "content-type": "video/mp4",
+                    "content-range": "bytes 0-10/100",
+                    "accept-ranges": "bytes",
+                    "content-length": "11",
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        class MockAsyncClient(httpx.AsyncClient):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                kwargs["transport"] = transport
+                super().__init__(*args, **kwargs)
+
+        async with app_client() as client:
+            monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+            response = await client.get(
+                "/play/session-1/stream",
+                headers={"Range": "bytes=0-99"},
+            )
+
+        assert response.status_code == 206
+        assert response.content == b"video-bytes"
+        assert response.headers["content-type"].startswith("video/mp4")
+        assert response.headers["content-range"] == "bytes 0-10/100"
+        assert response.headers["accept-ranges"] == "bytes"
+        assert requests[0].url.host == "download.example"
+
+    anyio.run(run_test)
+
+
+def test_play_stream_advertises_byte_ranges_when_upstream_has_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_test() -> None:
+        main.PLAY_SESSIONS["session-1"] = main.PlaySession(
+            id="session-1",
+            direct_url="https://download.example/movie.mp4?token=rd-secret",
+            filename="movie.mp4",
+            mime_type="video/mp4",
+            created_at=main.time.monotonic(),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert "range" not in request.headers
+            return httpx.Response(
+                200,
+                content=b"video-bytes",
+                headers={
+                    "content-type": "video/mp4",
+                    "content-length": "11",
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        class MockAsyncClient(httpx.AsyncClient):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                kwargs["transport"] = transport
+                super().__init__(*args, **kwargs)
+
+        async with app_client() as client:
+            monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+            response = await client.get("/play/session-1/stream")
+
+        assert response.status_code == 200
+        assert response.headers["accept-ranges"] == "bytes"
+        assert response.headers["content-length"] == "11"
+
+    anyio.run(run_test)
+
+
+def test_play_stream_supports_head_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_test() -> None:
+        main.PLAY_SESSIONS["session-1"] = main.PlaySession(
+            id="session-1",
+            direct_url="https://download.example/movie.mp4?token=rd-secret",
+            filename="movie.mp4",
+            mime_type="video/mp4",
+            created_at=main.time.monotonic(),
+        )
+        methods: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "video/mp4",
+                    "content-length": "1000",
+                    "accept-ranges": "bytes",
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        class MockAsyncClient(httpx.AsyncClient):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                kwargs["transport"] = transport
+                super().__init__(*args, **kwargs)
+
+        async with app_client() as client:
+            monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+            response = await client.head("/play/session-1/stream")
+
+        assert response.status_code == 200
+        assert response.content == b""
+        assert response.headers["content-type"].startswith("video/mp4")
+        assert response.headers["content-length"] == "1000"
+        assert response.headers["accept-ranges"] == "bytes"
+        assert methods == ["HEAD"]
+
+    anyio.run(run_test)
+
+
+def test_play_stream_error_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_test() -> None:
+        main.PLAY_SESSIONS["session-1"] = main.PlaySession(
+            id="session-1",
+            direct_url="https://download.example/movie.mp4?token=rd-secret",
+            filename="movie.mp4",
+            mime_type="video/mp4",
+            created_at=main.time.monotonic(),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text="secret upstream failure")
+
+        transport = httpx.MockTransport(handler)
+
+        class MockAsyncClient(httpx.AsyncClient):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                kwargs["transport"] = transport
+                super().__init__(*args, **kwargs)
+
+        async with app_client() as client:
+            monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
+            response = await client.get("/play/session-1/stream")
+
+        assert response.status_code == 502
+        assert "Playback stream is temporarily unavailable." in response.text
+        assert "rd-secret" not in response.text
+        assert "download.example" not in response.text
+        assert "secret upstream failure" not in response.text
 
     anyio.run(run_test)
 
@@ -354,16 +701,23 @@ def test_real_debrid_and_aria2_clients_use_expected_endpoints(
                 )
             if request.url.path == "/jsonrpc":
                 payload = json.loads(request.content)
-                assert payload["method"] == "aria2.addUri"
-                assert payload["params"] == [
-                    "token:aria-secret",
-                    ["https://download.example/file"],
-                    {
-                        "dir": "/downloads",
-                        "max-connection-per-server": "8",
-                        "split": "8",
-                    },
-                ]
+                if payload["method"] == "aria2.changeGlobalOption":
+                    assert payload["params"] == [
+                        "token:aria-secret",
+                        {"max-concurrent-downloads": "1"},
+                    ]
+                elif payload["method"] == "aria2.addUri":
+                    assert payload["params"] == [
+                        "token:aria-secret",
+                        ["https://download.example/file"],
+                        {
+                            "dir": "/downloads",
+                            "max-connection-per-server": "8",
+                            "split": "8",
+                        },
+                    ]
+                else:
+                    raise AssertionError(f"unexpected aria2 method {payload['method']}")
                 return httpx.Response(
                     200,
                     json={"jsonrpc": "2.0", "id": payload["id"], "result": "gid-2"},
@@ -395,6 +749,7 @@ def test_real_debrid_and_aria2_clients_use_expected_endpoints(
             "/rest/1.0/hosts/domains",
             "/rest/1.0/unrestrict/check",
             "/rest/1.0/unrestrict/link",
+            "/jsonrpc",
             "/jsonrpc",
         ]
 
@@ -488,6 +843,7 @@ def test_aria2_client_queue_reads_and_controls_use_expected_rpc(
         monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient)
         aria2 = Aria2Client(make_settings())
 
+        await aria2.configure_queue_options()
         assert await aria2.tell_active() == []
         assert await aria2.tell_waiting() == []
         assert await aria2.tell_stopped() == []
@@ -500,8 +856,13 @@ def test_aria2_client_queue_reads_and_controls_use_expected_rpc(
         await aria2.move("gid-1", "up")
         await aria2.move("gid-1", "down")
         await aria2.move("gid-1", "bottom")
+        await aria2.move_to("gid-1", 2)
 
         assert methods == [
+            (
+                "aria2.changeGlobalOption",
+                ["token:aria-secret", {"max-concurrent-downloads": "1"}],
+            ),
             ("aria2.tellActive", ["token:aria-secret"]),
             ("aria2.tellWaiting", ["token:aria-secret", 0, 100]),
             ("aria2.tellStopped", ["token:aria-secret", 0, 50]),
@@ -514,6 +875,7 @@ def test_aria2_client_queue_reads_and_controls_use_expected_rpc(
             ("aria2.changePosition", ["token:aria-secret", "gid-1", -1, "POS_CUR"]),
             ("aria2.changePosition", ["token:aria-secret", "gid-1", 1, "POS_CUR"]),
             ("aria2.changePosition", ["token:aria-secret", "gid-1", 0, "POS_END"]),
+            ("aria2.changePosition", ["token:aria-secret", "gid-1", 2, "POS_SET"]),
         ]
 
     anyio.run(run_test)
@@ -582,12 +944,25 @@ def test_queue_page_renders_downloads_and_controls() -> None:
         assert "waiting.iso" in text
         assert "done.iso" in text
         assert '/queue/active-1/pause' in text
+        assert 'data-queue-gid="waiting-1"' in text
+        assert 'data-can-reorder="true"' in text
+        assert 'draggable="true"' in text
+        assert 'data-drag-handle' in text
         assert '/queue/waiting-1/move' in text
         assert '/queue/stopped-1/clear' in text
         assert '/queue/clear-stopped' in text
         assert f"v{main.__version__}" in text
 
     anyio.run(run_test)
+
+
+def test_queue_javascript_supports_drag_reorder_api_and_pauses_live_updates() -> None:
+    script = Path("app/static/queue.js").read_text(encoding="utf-8")
+
+    assert "`/api/queue/${encodeURIComponent(gid)}/move`" in script
+    assert "JSON.stringify({ position })" in script
+    assert "draggedItem || isSubmittingMove" in script
+    assert "pendingHtml = payload.html" in script
 
 
 def test_api_queue_returns_sanitized_queue_and_group_state() -> None:
@@ -673,6 +1048,9 @@ def test_api_queue_action_routes_call_aria2() -> None:
         async def purge_download_result(self) -> None:
             calls.append("purge")
 
+        async def move_to(self, gid: str, position: int) -> None:
+            calls.append(f"move_to:{gid}:{position}")
+
     async def run_test() -> None:
         app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
         async with app_client() as client:
@@ -682,6 +1060,7 @@ def test_api_queue_action_routes_call_aria2() -> None:
                 await client.post("/api/queue/gid-1/remove"),
                 await client.post("/api/queue/gid-1/clear"),
                 await client.post("/api/queue/clear-stopped"),
+                await client.post("/api/queue/gid-1/move", json={"position": 2}),
             ]
 
         assert all(response.status_code == 200 for response in responses)
@@ -692,7 +1071,29 @@ def test_api_queue_action_routes_call_aria2() -> None:
             "remove:gid-1",
             "clear:gid-1",
             "purge",
+            "move_to:gid-1:2",
         ]
+
+    anyio.run(run_test)
+
+
+def test_api_queue_move_rejects_invalid_position_without_leaking_details() -> None:
+    class FakeAria2:
+        async def move_to(self, gid: str, position: int) -> None:
+            raise ValueError("token:aria-secret failed at https://aria2.test/jsonrpc")
+
+    async def run_test() -> None:
+        app.dependency_overrides[main.get_aria2_client] = dependency_override(FakeAria2())
+        async with app_client() as client:
+            response = await client.post("/api/queue/gid-1/move", json={"position": -1})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": False,
+            "message": "Queue action failed. Please try again.",
+        }
+        assert "aria-secret" not in response.text
+        assert "aria2.test" not in response.text
 
     anyio.run(run_test)
 
@@ -868,6 +1269,7 @@ def test_multipart_group_projection_updates_display_without_writing_state(tmp_pa
         assert response.status_code == 200
         assert "release.part1.rar - active" in response.text
         assert "500 B / 1000 B" in response.text
+        assert "/queue/groups/group-1/clear" in response.text
 
         persisted = store.load_groups()[0]
         assert persisted.parts[0].status == "submitted"
@@ -876,7 +1278,7 @@ def test_multipart_group_projection_updates_display_without_writing_state(tmp_pa
     anyio.run(run_test)
 
 
-def test_group_state_clear_removes_only_eligible_terminal_group(tmp_path: Any) -> None:
+def test_group_state_clear_removes_any_group_metadata(tmp_path: Any) -> None:
     store = main.GroupStateStore(str(tmp_path / "groups.json"))
     active_group = main.DownloadGroup(
         id="active-group",
@@ -896,12 +1298,12 @@ def test_group_state_clear_removes_only_eligible_terminal_group(tmp_path: Any) -
     )
     store.save_groups([active_group, terminal_group])
 
-    assert store.remove_group("active-group") is False
+    assert store.remove_group("active-group") is True
     assert store.remove_group("terminal-group") is True
-    assert [group.id for group in store.load_groups()] == ["active-group"]
+    assert store.load_groups() == []
 
 
-def test_group_state_bulk_clear_preserves_active_groups(tmp_path: Any) -> None:
+def test_group_state_bulk_clear_removes_all_group_metadata(tmp_path: Any) -> None:
     store = main.GroupStateStore(str(tmp_path / "groups.json"))
     groups = [
         main.DownloadGroup(
@@ -932,8 +1334,8 @@ def test_group_state_bulk_clear_preserves_active_groups(tmp_path: Any) -> None:
     ]
     store.save_groups(groups)
 
-    assert store.clear_eligible_groups() == 2
-    assert [group.id for group in store.load_groups()] == ["active-group"]
+    assert store.clear_eligible_groups() == 3
+    assert store.load_groups() == []
 
 
 def test_group_clear_routes_redirect_with_messages(tmp_path: Any) -> None:
@@ -969,9 +1371,9 @@ def test_group_clear_routes_redirect_with_messages(tmp_path: Any) -> None:
         assert single.status_code == 303
         assert "Multipart+group+history+entry+cleared" in single.headers["location"]
         assert active.status_code == 303
-        assert "level=error" in active.headers["location"]
+        assert "Multipart+group+history+entry+cleared" in active.headers["location"]
         assert bulk.status_code == 303
-        assert "No+completed+multipart+group+history" in bulk.headers["location"]
+        assert "No+multipart+group+history" in bulk.headers["location"]
 
     anyio.run(run_test)
 
@@ -1009,7 +1411,7 @@ def test_api_group_clear_routes_return_json_messages(tmp_path: Any) -> None:
         assert single.status_code == 200
         assert single.json() == {"ok": True, "message": "Multipart group history entry cleared."}
         assert active.status_code == 200
-        assert active.json()["ok"] is False
+        assert active.json() == {"ok": True, "message": "Multipart group history entry cleared."}
         assert bulk.status_code == 200
         assert bulk.json()["ok"] is False
 
@@ -1686,6 +2088,7 @@ def make_settings(**overrides: Any) -> Settings:
         "aria2_rpc_secret": "aria-secret",
         "aria2_download_dir": "/downloads",
         "aria2_max_connection_per_server": "8",
+        "aria2_max_concurrent_downloads": 1,
         "aria2_split": "8",
         "submitted_url_logging": False,
         "app_download_dir": "/downloads",

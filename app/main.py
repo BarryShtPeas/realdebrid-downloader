@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
@@ -16,9 +18,10 @@ from urllib.parse import urlencode, urlparse
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from app import __version__
 from app.views import (
@@ -34,7 +37,12 @@ NO_DOWNLOAD_MESSAGE = "No download available from Real-Debrid for this link."
 NO_TORRENT_READY_MESSAGE = "Torrent is not ready on Real-Debrid yet. Please try again later."
 TORRENT_PROCESSING_FAILED_MESSAGE = "Real-Debrid could not process this magnet link."
 NO_SUPPORTED_ARCHIVE_MESSAGE = "Could not find a supported archive start file."
+PLAY_MULTI_LINK_MESSAGE = "Play supports one hoster URL at a time. Use Download for multi-link or multipart submissions."
+PLAY_MAGNET_MESSAGE = "Play does not support magnet links yet. Use Download to send magnet links to the queue."
+PLAY_UNSUPPORTED_MESSAGE = "This Real-Debrid link is not marked as browser-streamable. Use Download to send it to aria2."
+PLAY_SESSION_EXPIRED_MESSAGE = "Playback session expired. Paste the link again to start a new player."
 TORRENT_ERROR_STATUSES = {"magnet_error", "error", "virus", "dead"}
+PLAY_SESSION_TTL_SECONDS = 6 * 60 * 60
 
 logger = logging.getLogger("rd_downloader")
 
@@ -43,6 +51,10 @@ logger = logging.getLogger("rd_downloader")
 async def lifespan(fastapi_app: FastAPI) -> Any:
     settings = Settings.from_env()
     task: asyncio.Task[Any] | None = None
+    try:
+        await Aria2Client(settings).configure_queue_options()
+    except UpstreamError as exc:
+        logger.warning("aria2 queue configuration failed during startup: %s", exc)
     if settings.group_poll_seconds > 0:
         task = asyncio.create_task(group_monitor_loop(settings))
         fastapi_app.state.group_monitor_task = task
@@ -134,6 +146,13 @@ class ApiQueueResponse(BaseModel):
     groups: list[ApiGroupResult]
 
 
+class ApiQueueMoveRequest(BaseModel):
+    position: int = Field(
+        ...,
+        description="Zero-based target position in aria2's waiting queue.",
+    )
+
+
 class ApiMessageResponse(BaseModel):
     ok: bool
     message: str
@@ -156,6 +175,7 @@ class Settings:
     aria2_rpc_secret: str | None
     aria2_download_dir: str
     aria2_max_connection_per_server: str
+    aria2_max_concurrent_downloads: int
     aria2_split: str
     submitted_url_logging: bool
     app_download_dir: str
@@ -181,6 +201,12 @@ class Settings:
             aria2_max_connection_per_server=os.getenv(
                 "ARIA2_MAX_CONNECTION_PER_SERVER",
                 "8",
+            ),
+            aria2_max_concurrent_downloads=parse_env_int_range(
+                "ARIA2_MAX_CONCURRENT_DOWNLOADS",
+                default=1,
+                minimum=1,
+                maximum=3,
             ),
             aria2_split=os.getenv("ARIA2_SPLIT", "8"),
             submitted_url_logging=os.getenv("APP_SUBMITTED_URL_LOGGING", "false").lower()
@@ -210,6 +236,30 @@ class DownloadResult:
     local_path: str | None = None
     submitted_hostname: str | None = None
     source_label: str | None = None
+
+
+@dataclass
+class PlayResult:
+    ok: bool
+    message: str
+    filename: str | None = None
+    direct_url: str | None = None
+    stream_url: str | None = None
+    mime_type: str | None = None
+    realdebrid_id: str | None = None
+    streamable: bool | None = None
+    host_supported: bool | None = None
+    submitted_hostname: str | None = None
+    source_label: str | None = None
+
+
+@dataclass(frozen=True)
+class PlaySession:
+    id: str
+    direct_url: str
+    filename: str | None
+    mime_type: str | None
+    created_at: float
 
 
 @dataclass(frozen=True)
@@ -521,6 +571,67 @@ def parse_env_float(name: str, default: float) -> float:
         return default
 
 
+def parse_env_int_range(name: str, default: int, minimum: int, maximum: int) -> int:
+    value = parse_env_int(name, default)
+    return min(max(value, minimum), maximum)
+
+
+def parse_streamable(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def guess_media_type(filename: str | None) -> str | None:
+    if not filename:
+        return None
+    media_type, _encoding = mimetypes.guess_type(filename)
+    return media_type
+
+
+PLAY_SESSIONS: dict[str, PlaySession] = {}
+
+
+def create_play_session(result: PlayResult) -> PlaySession:
+    if not result.direct_url:
+        raise ValueError("Play result does not include a direct URL.")
+    purge_expired_play_sessions()
+    session_id = uuid.uuid4().hex
+    session = PlaySession(
+        id=session_id,
+        direct_url=result.direct_url,
+        filename=result.filename,
+        mime_type=result.mime_type,
+        created_at=time.monotonic(),
+    )
+    PLAY_SESSIONS[session_id] = session
+    return session
+
+
+def get_play_session(session_id: str) -> PlaySession | None:
+    purge_expired_play_sessions()
+    return PLAY_SESSIONS.get(session_id)
+
+
+def purge_expired_play_sessions() -> None:
+    now = time.monotonic()
+    expired = [
+        session_id
+        for session_id, session in PLAY_SESSIONS.items()
+        if now - session.created_at > PLAY_SESSION_TTL_SECONDS
+    ]
+    for session_id in expired:
+        PLAY_SESSIONS.pop(session_id, None)
+
+
 class DownloadUnavailableError(Exception):
     pass
 
@@ -728,7 +839,20 @@ class Aria2Client:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
+    async def configure_queue_options(self) -> None:
+        await self._rpc(
+            "aria2.changeGlobalOption",
+            [
+                {
+                    "max-concurrent-downloads": str(
+                        self.settings.aria2_max_concurrent_downloads,
+                    ),
+                },
+            ],
+        )
+
     async def add_uri(self, direct_url: str) -> str:
+        await self.configure_queue_options()
         result = await self._rpc(
             "aria2.addUri",
             [
@@ -786,6 +910,11 @@ class Aria2Client:
 
     async def change_position(self, gid: str, position: int, how: str) -> None:
         await self._rpc("aria2.changePosition", [gid, position, how])
+
+    async def move_to(self, gid: str, position: int) -> None:
+        if position < 0:
+            raise ValueError("Queue position must be zero or greater.")
+        await self.change_position(gid, position, "POS_SET")
 
     async def move(self, gid: str, direction: str) -> None:
         if direction == "top":
@@ -859,6 +988,43 @@ class Downloader:
             return submission.downloads[0]
         return DownloadResult(ok=False, message=submission.message)
 
+    async def prepare_play(self, submitted_text: str) -> PlayResult:
+        submissions = extract_urls(submitted_text)
+        if not submissions:
+            return PlayResult(
+                ok=False,
+                message="Paste one valid http:// or https:// hoster link to play.",
+            )
+        if len(submissions) > 1:
+            return PlayResult(ok=False, message=PLAY_MULTI_LINK_MESSAGE)
+        submitted_url = submissions[0]
+        if is_magnet_link(submitted_url):
+            return PlayResult(ok=False, message=PLAY_MAGNET_MESSAGE, source_label="magnet link")
+        try:
+            result = await self._resolve_hoster_link_for_play(submitted_url)
+        except DownloadUnavailableError:
+            return PlayResult(
+                ok=False,
+                message=NO_DOWNLOAD_MESSAGE,
+                submitted_hostname=submitted_hostname(submitted_url),
+                source_label=submitted_source_label(submitted_url),
+            )
+        if not result.ok:
+            return result
+        if result.streamable is False:
+            return PlayResult(
+                ok=False,
+                message=PLAY_UNSUPPORTED_MESSAGE,
+                filename=result.filename,
+                mime_type=result.mime_type,
+                realdebrid_id=result.realdebrid_id,
+                streamable=result.streamable,
+                host_supported=result.host_supported,
+                submitted_hostname=result.submitted_hostname,
+                source_label=result.source_label,
+            )
+        return result
+
     async def submit_urls(self, submitted_urls: list[str]) -> SubmissionResult:
         results: list[DownloadResult] = []
         for submitted_url in submitted_urls:
@@ -913,6 +1079,29 @@ class Downloader:
         return [await self._submit_hoster_link(submitted_url)]
 
     async def _submit_hoster_link(self, submitted_url: str) -> DownloadResult:
+        resolved = await self._resolve_hoster_link_for_download(submitted_url)
+        if not resolved.ok or not resolved.direct_url:
+            return resolved
+
+        gid = await self.aria2.add_uri(resolved.direct_url)
+        resolved.aria2_gid = gid
+        resolved.message = "Download submitted to aria2."
+        return resolved
+
+    async def _resolve_hoster_link_for_download(self, submitted_url: str) -> DownloadResult:
+        play = await self._resolve_hoster_link_for_play(submitted_url)
+        return DownloadResult(
+            ok=play.ok,
+            message=play.message,
+            filename=play.filename,
+            direct_url=play.direct_url,
+            host_supported=play.host_supported,
+            local_path=local_download_path(self.settings.aria2_download_dir, play.filename),
+            submitted_hostname=play.submitted_hostname,
+            source_label=play.source_label,
+        )
+
+    async def _resolve_hoster_link_for_play(self, submitted_url: str) -> PlayResult:
         self._log_submission(submitted_url)
         host_supported = await self._host_supported(submitted_url)
         source_label = submitted_source_label(submitted_url)
@@ -920,7 +1109,7 @@ class Downloader:
         try:
             await self.realdebrid.check_link(submitted_url)
         except DownloadUnavailableError:
-            return DownloadResult(
+            return PlayResult(
                 ok=False,
                 message=NO_DOWNLOAD_MESSAGE,
                 host_supported=host_supported,
@@ -933,9 +1122,11 @@ class Downloader:
             logger.info("Real-Debrid availability check was inconclusive: %s", exc)
 
         unrestricted = await self.realdebrid.unrestrict_link(submitted_url)
+        if not isinstance(unrestricted, dict):
+            raise DownloadUnavailableError
         direct_url = unrestricted.get("download")
         if not isinstance(direct_url, str) or not direct_url.startswith(("http://", "https://")):
-            return DownloadResult(
+            return PlayResult(
                 ok=False,
                 message=NO_DOWNLOAD_MESSAGE,
                 host_supported=host_supported,
@@ -943,17 +1134,19 @@ class Downloader:
                 source_label=source_label,
             )
 
-        gid = await self.aria2.add_uri(direct_url)
         filename = unrestricted.get("filename")
         safe_filename = filename if isinstance(filename, str) else None
-        return DownloadResult(
+        mime_type = unrestricted.get("mimeType")
+        realdebrid_id = unrestricted.get("id")
+        return PlayResult(
             ok=True,
-            message="Download submitted to aria2.",
-            aria2_gid=gid,
+            message="Ready to play.",
             filename=safe_filename,
             direct_url=direct_url,
+            mime_type=mime_type if isinstance(mime_type, str) and mime_type else guess_media_type(safe_filename),
+            realdebrid_id=realdebrid_id if isinstance(realdebrid_id, str) and realdebrid_id else None,
+            streamable=parse_streamable(unrestricted.get("streamable")),
             host_supported=host_supported,
-            local_path=local_download_path(self.settings.aria2_download_dir, safe_filename),
             submitted_hostname=submitted_hostname(submitted_url),
             source_label=source_label,
         )
@@ -1385,7 +1578,7 @@ async def api_queue_clear_groups(
         return ApiMessageResponse(ok=True, message="Cleared 1 multipart group history entry.")
     if removed_count > 1:
         return ApiMessageResponse(ok=True, message=f"Cleared {removed_count} multipart group history entries.")
-    return ApiMessageResponse(ok=False, message="No completed multipart group history to clear.")
+    return ApiMessageResponse(ok=False, message="No multipart group history to clear.")
 
 
 @app.post("/api/queue/groups/{group_id}/clear", response_model=ApiMessageResponse, tags=["multipart groups"])
@@ -1395,7 +1588,7 @@ async def api_queue_clear_group(
 ) -> ApiMessageResponse:
     if group_store.remove_group(group_id):
         return ApiMessageResponse(ok=True, message="Multipart group history entry cleared.")
-    return ApiMessageResponse(ok=False, message="Multipart group is still active or was not found.")
+    return ApiMessageResponse(ok=False, message="Multipart group was not found.")
 
 
 @app.post("/api/queue/{gid}/pause", response_model=ApiMessageResponse, tags=["queue"])
@@ -1430,6 +1623,15 @@ async def api_queue_clear(
     return await run_api_queue_action(aria2.remove_download_result(gid), "History entry cleared.")
 
 
+@app.post("/api/queue/{gid}/move", response_model=ApiMessageResponse, tags=["queue"])
+async def api_queue_move(
+    gid: str,
+    payload: ApiQueueMoveRequest,
+    aria2: Aria2Client = Depends(get_aria2_client),
+) -> ApiMessageResponse:
+    return await run_api_queue_action(aria2.move_to(gid, payload.position), "Download moved.")
+
+
 async def run_api_queue_action(action: Any, success_message: str) -> ApiMessageResponse:
     try:
         await action
@@ -1457,6 +1659,24 @@ async def submit_download_text(submitted_text: str, downloader: Any) -> Submissi
         )
     except DownloadUnavailableError:
         return SubmissionResult(ok=False, message=NO_DOWNLOAD_MESSAGE, downloads=[])
+
+
+async def play_download_text(submitted_text: str, downloader: Any) -> PlayResult:
+    try:
+        if hasattr(downloader, "prepare_play"):
+            return await downloader.prepare_play(submitted_text)
+        return PlayResult(ok=False, message="Playback is unavailable for this downloader.")
+    except ConfigurationError as exc:
+        logger.warning("Downloader configuration error: %s", exc)
+        return PlayResult(ok=False, message=str(exc))
+    except UpstreamError as exc:
+        logger.warning("Downloader upstream error: %s", exc)
+        return PlayResult(
+            ok=False,
+            message="Download service is temporarily unavailable. Please try again later.",
+        )
+    except DownloadUnavailableError:
+        return PlayResult(ok=False, message=NO_DOWNLOAD_MESSAGE)
 
 
 def api_submit_response(result: SubmissionResult) -> ApiSubmitResponse:
@@ -1556,6 +1776,46 @@ async def submit(
     return render_page(result)
 
 
+@app.post("/play", response_class=HTMLResponse, include_in_schema=False)
+async def play(
+    url: str = Form(...),
+    downloader: Downloader = Depends(get_downloader),
+) -> str:
+    result = await play_download_text(url, downloader)
+    if result.ok:
+        session = create_play_session(result)
+        result.direct_url = None
+        result.stream_url = f"/play/{session.id}/stream"
+    return render_page(play_result=result)
+
+
+@app.get("/play/{session_id}/stream", include_in_schema=False)
+async def play_stream(
+    session_id: str,
+    request: Request,
+) -> Any:
+    return await play_stream_response(session_id, request, "GET")
+
+
+@app.head("/play/{session_id}/stream", include_in_schema=False)
+async def play_stream_head(
+    session_id: str,
+    request: Request,
+) -> Any:
+    return await play_stream_response(session_id, request, "HEAD")
+
+
+async def play_stream_response(session_id: str, request: Request, method: str) -> Any:
+    session = get_play_session(session_id)
+    if session is None:
+        return PlainTextResponse(PLAY_SESSION_EXPIRED_MESSAGE, status_code=404)
+    try:
+        return await proxy_play_session(session, request.headers.get("range"), method)
+    except httpx.HTTPError as exc:
+        logger.warning("Real-Debrid playback proxy failed: %s", exc)
+        return PlainTextResponse("Playback stream is temporarily unavailable.", status_code=502)
+
+
 def submission_contains_magnet(submitted_text: str) -> bool:
     return any(is_magnet_link(submission) for submission in extract_urls(submitted_text))
 
@@ -1634,7 +1894,7 @@ async def queue_clear_groups(
         return queue_redirect("Cleared 1 multipart group history entry.", "success")
     if removed_count > 1:
         return queue_redirect(f"Cleared {removed_count} multipart group history entries.", "success")
-    return queue_redirect("No completed multipart group history to clear.", "error")
+    return queue_redirect("No multipart group history to clear.", "error")
 
 
 @app.post("/queue/groups/{group_id}/clear", include_in_schema=False)
@@ -1644,7 +1904,7 @@ async def queue_clear_group(
 ) -> RedirectResponse:
     if group_store.remove_group(group_id):
         return queue_redirect("Multipart group history entry cleared.", "success")
-    return queue_redirect("Multipart group is still active or was not found.", "error")
+    return queue_redirect("Multipart group was not found.", "error")
 
 
 @app.post("/queue/{gid}/pause", include_in_schema=False)
@@ -1711,6 +1971,71 @@ async def run_queue_action(action: Any, success_message: str) -> RedirectRespons
 def queue_redirect(message: str, level: str) -> RedirectResponse:
     query = urlencode({"message": message, "level": level})
     return RedirectResponse(f"/queue?{query}", status_code=303)
+
+
+async def proxy_play_session(
+    session: PlaySession,
+    range_header: str | None,
+    method: str = "GET",
+) -> Response:
+    request_headers = {}
+    if range_header:
+        request_headers["Range"] = range_header
+    client = httpx.AsyncClient(timeout=None, follow_redirects=True)
+    try:
+        request = client.build_request(method, session.direct_url, headers=request_headers)
+        upstream = await client.send(request, stream=True)
+        upstream.raise_for_status()
+    except Exception:
+        await client.aclose()
+        raise
+
+    response_headers = play_proxy_headers(upstream.headers, session)
+    if method == "HEAD":
+        await close_play_proxy(upstream, client)
+        return Response(
+            status_code=upstream.status_code,
+            media_type=response_headers.pop("content-type", None),
+            headers=response_headers,
+        )
+    media_type = response_headers.pop("content-type", None) or "application/octet-stream"
+    return StreamingResponse(
+        upstream.aiter_bytes(),
+        status_code=upstream.status_code,
+        media_type=media_type,
+        headers=response_headers,
+        background=BackgroundTask(close_play_proxy, upstream, client),
+    )
+
+
+def play_proxy_headers(upstream_headers: httpx.Headers, session: PlaySession) -> dict[str, str]:
+    response_headers: dict[str, str] = {}
+    for header in ["cache-control", "content-length", "content-range", "etag", "last-modified"]:
+        value = upstream_headers.get(header)
+        if value:
+            response_headers[header] = value
+    accept_ranges = upstream_headers.get("accept-ranges")
+    if accept_ranges:
+        response_headers["accept-ranges"] = accept_ranges
+    elif response_headers.get("content-length") or response_headers.get("content-range"):
+        response_headers["accept-ranges"] = "bytes"
+    filename = session.filename or "video"
+    response_headers["Content-Disposition"] = f'inline; filename="{safe_header_filename(filename)}"'
+    response_headers["content-type"] = (
+        upstream_headers.get("content-type")
+        or session.mime_type
+        or "application/octet-stream"
+    )
+    return response_headers
+
+
+async def close_play_proxy(upstream: httpx.Response, client: httpx.AsyncClient) -> None:
+    await upstream.aclose()
+    await client.aclose()
+
+
+def safe_header_filename(filename: str) -> str:
+    return os.path.basename(filename).replace("\\", "_").replace('"', "_") or "video"
 
 
 async def queue_event_stream(

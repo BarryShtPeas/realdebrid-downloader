@@ -3,6 +3,10 @@
   "name": "RDD Sender",
   "description": "Send links and selected URLs to a Real-Debrid Downloader instance.",
   "version": "0.1.0",
+  "icons": {
+    "48": "icon.svg",
+    "96": "icon.svg"
+  },
   "browser_specific_settings": {
     "gecko": {
       "id": "rdd-sender@realdebrid-downloader.local",
@@ -28,6 +32,10 @@
     "open_in_tab": true
   },
   "action": {
-    "default_title": "RDD Sender"
+    "default_title": "RDD Sender",
+    "default_icon": {
+      "48": "icon.svg",
+      "96": "icon.svg"
+    }
   }
 }

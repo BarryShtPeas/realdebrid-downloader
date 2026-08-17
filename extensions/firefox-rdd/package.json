@@ -1,0 +1,14 @@
+{
+  "name": "rdd-sender-firefox-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Firefox WebExtension for sending links to a Real-Debrid Downloader instance.",
+  "scripts": {
+    "lint": "web-ext lint --source-dir . --ignore-files README.md package.json package-lock.json web-ext-artifacts",
+    "build": "web-ext build --source-dir . --artifacts-dir web-ext-artifacts --overwrite-dest --ignore-files README.md package.json package-lock.json web-ext-artifacts",
+    "sign": "web-ext sign --source-dir . --artifacts-dir web-ext-artifacts --channel unlisted --ignore-files README.md package.json package-lock.json web-ext-artifacts"
+  },
+  "devDependencies": {
+    "web-ext": "^8.0.0"
+  }
+}

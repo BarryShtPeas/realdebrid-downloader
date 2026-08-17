@@ -11,7 +11,7 @@ GROUP_TERMINAL_PART_STATUSES = {"complete", "error", "removed"}
 GROUP_TERMINAL_EXTRACTION_STATUSES = {"complete", "failed", "skipped"}
 
 
-def render_page(result: Any | None = None) -> str:
+def render_page(result: Any | None = None, play_result: Any | None = None) -> str:
     result_html = ""
     if result is not None:
         status = "success" if result.ok else "error"
@@ -46,6 +46,42 @@ def render_page(result: Any | None = None) -> str:
             "</section>"
         )
 
+    play_html = ""
+    if play_result is not None:
+        status = "success" if play_result.ok else "error"
+        details: list[str] = []
+        if play_result.filename:
+            details.append(f"File: {html.escape(play_result.filename)}")
+        if play_result.mime_type:
+            details.append(f"Type: {html.escape(play_result.mime_type)}")
+        if play_result.streamable is False:
+            details.append("Real-Debrid did not mark this file as streamable.")
+        if play_result.host_supported is False:
+            details.append("Real-Debrid did not list this host, but unrestrict was attempted.")
+        detail_html = "".join(f"<p>{detail}</p>" for detail in details)
+        player_html = ""
+        if play_result.ok and play_result.stream_url:
+            source_type = (
+                f' type="{html.escape(play_result.mime_type, quote=True)}"'
+                if play_result.mime_type
+                else ""
+            )
+            player_html = (
+                '<section class="player" aria-label="Video player">'
+                '<video controls autoplay playsinline preload="metadata">'
+                f'<source src="{html.escape(play_result.stream_url, quote=True)}"{source_type}>'
+                "Your browser cannot play this video."
+                "</video>"
+                "</section>"
+            )
+        play_html = (
+            f'<section class="result {status}" role="status">'
+            f"<p>{html.escape(play_result.message)}</p>"
+            f"{detail_html}"
+            "</section>"
+            f"{player_html}"
+        )
+
     return f"""
     <!doctype html>
     <html lang="en">
@@ -62,14 +98,18 @@ def render_page(result: Any | None = None) -> str:
             <a href="/queue">Queue</a>
           </nav>
           <h1>Real-Debrid Downloader</h1>
-          <p>Submit a hoster link or magnet link and send the Real-Debrid download to the internal aria2 worker.</p>
+          <p>Play one streamable hoster link in the browser, or download hoster and magnet links through the internal aria2 worker.</p>
           {result_html}
+          {play_html}
           <form class="submit-form" method="post" action="/submit">
             <label>
               Hoster URLs or magnet links
               <textarea name="url" required autocomplete="off" placeholder="Paste one URL, magnet link, or a block of text containing multiple links"></textarea>
             </label>
-            <button type="submit">Submit to aria2</button>
+            <div class="submit-actions">
+              <button type="submit" formaction="/play">Play</button>
+              <button type="submit">Download</button>
+            </div>
           </form>
           <p class="app-version">v{html.escape(__version__)}</p>
         </main>
@@ -251,9 +291,7 @@ def project_groups_for_display(
 
 
 def is_group_clearable(group: Any) -> bool:
-    if group.extraction_status in GROUP_TERMINAL_EXTRACTION_STATUSES:
-        return True
-    return bool(group.parts) and all(part.status in GROUP_TERMINAL_PART_STATUSES for part in group.parts)
+    return bool(getattr(group, "id", None))
 
 
 def render_queue_section(
@@ -284,6 +322,16 @@ def render_queue_item(item: Any) -> str:
     gid = html.escape(item.gid, quote=True)
     status = html.escape(item.status)
     progress = f"{item.progress_percent:.1f}"
+    item_class = "item queue-item"
+    item_attrs = f'data-queue-gid="{gid}"'
+    drag_handle = ""
+    if item.can_reorder:
+        item_class += " reorderable"
+        item_attrs += ' data-can-reorder="true" draggable="true"'
+        drag_handle = (
+            '<button class="drag-handle" type="button" data-drag-handle '
+            f'aria-label="Drag {html.escape(item.name, quote=True)} to reorder">Move</button>'
+        )
     meta = [
         f"Status: {status}",
         f"aria2 id: {html.escape(item.gid)}",
@@ -318,8 +366,11 @@ def render_queue_item(item: Any) -> str:
     meta_html = "".join(f"<span>{entry}</span>" for entry in meta)
     controls_html = "".join(controls)
     return (
-        '<article class="item">'
+        f'<article class="{item_class}" {item_attrs}>'
+        '<div class="item-title">'
+        f"{drag_handle}"
         f"<h3>{html.escape(item.name)}</h3>"
+        "</div>"
         f'<div class="meta">{meta_html}</div>'
         '<div class="progress" aria-hidden="true">'
         f'<span style="width: {progress}%"></span>'
