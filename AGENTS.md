@@ -4,6 +4,11 @@ This repository is the standalone, self-hostable source for the Real-Debrid down
 
 ## Grace Task Workspace Guard
 
+- Use `ssh grace-codex-container` as the default entrypoint for Grace-hosted agent/dev work. Confirm `HOSTNAME=grace-codex-container` before operating on Grace repos.
+- Work from `/mnt/cache/repos/<repo>` or `/mnt/cache/repos/.worktrees/<task-slug>/<repo>`, not `/mnt/user/repos`.
+- Use `ssh grace` only for host-only Docker, publish, deploy, ownership, or recovery operations; do not mount the Docker socket into the Codex container.
+- Never make `/mnt/user/appdata/docker` or `/mnt/user/appdata/homeassistant` Git checkouts.
+- Treat live state as authoritative when reconciling drift; live changes supersede stale docs and repo state until intentionally folded back into source.
 - At task start, run `/mnt/cache/repos/home-ops-docs/scripts/grace-estate-status.sh` when available so dirty Grace repo state is visible before edits.
 - Start standalone app behavior, tests, and extension work in this repo.
 - If the request may also require Grace Compose wiring, Traefik routes, image tags, deployment docs, monitoring, or repo instruction changes, create a task workspace before editing:
@@ -11,6 +16,9 @@ This repository is the standalone, self-hostable source for the Real-Debrid down
 - If worktree creation fails with `Read-only file system` or sandbox permission errors, rerun the same helper command with sandbox escalation/approval; do not switch to an app-managed handoff worktree solely for that failure.
 - Continue active cross-repo work from `/mnt/cache/repos/.worktrees/<task-slug>/realdebrid-downloader`; keep `/mnt/cache/repos/realdebrid-downloader` clean as the canonical checkout.
 - If app work started in the canonical checkout becomes cross-repo, stop before more edits and move or commit the current task changes into a task workspace.
+
+Keep this AGENTS-only Grace operator context out of app docs, examples, code,
+tests, and image artifacts so the project remains self-hostable.
 
 ## Maintenance Rules
 
