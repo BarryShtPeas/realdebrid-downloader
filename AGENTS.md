@@ -1,6 +1,8 @@
 # Agent Instructions
 
-This repository is the standalone, self-hostable source for the Real-Debrid downloader web app. Keep it deployable as a Docker image with no dependency on any private infrastructure.
+This is the repo-local Codex rulebook for the standalone Real-Debrid downloader web app. Keep it deployable as a Docker image with no dependency on any private infrastructure.
+
+For cross-repo task routing, start in `/mnt/cache/repos/home-ops-docs` and read `codex/repository-manifest.yaml`. The central Codex operating model lives in `/mnt/cache/repos/home-ops-docs/codex/agent-operating-model.md`.
 
 ## Grace Task Workspace Guard
 
@@ -41,3 +43,13 @@ The initial scaffold is intentionally minimal. Implement the production flow beh
 3. Call Real-Debrid unrestrict endpoints.
 4. Submit the generated direct download URL to aria2.
 5. Show a clear result without exposing secrets or full submitted URLs in logs.
+
+<!-- OPENWIKI:START -->
+
+## OpenWiki
+
+OpenWiki instructions live in `openwiki/INSTRUCTIONS.md`. Generated OpenWiki pages are optional just-in-time LLM context, not required startup reading.
+
+Do not hand-edit generated OpenWiki pages unless explicitly asked; prefer updating source code, tests, app docs, or `home-ops-docs` and letting OpenWiki regenerate.
+
+<!-- OPENWIKI:END -->
