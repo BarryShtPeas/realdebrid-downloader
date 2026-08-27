@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:072e30e748a0688507515b3a7726b55a9ddf186c16d05461e6ac62e3cd67c1f8",
+  "claims": [
+    {
+      "id": "claim_fa69b84cd7314ca3a7a47d04434a4c9c",
+      "statement": "The Real-Debrid Downloader repo owns FastAPI source, tests, Dockerfile, portable compose example, Firefox extension, and GHCR image workflows.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        }
+      ]
+    },
+    {
+      "id": "claim_2d8b1c180bf64edd8de5920bf95751c2",
+      "statement": "App docs, examples, code, tests, and image artifacts must avoid private Grace hostnames, internal paths, operator-specific assumptions, Real-Debrid tokens, GHCR tokens, aria2 RPC secrets, submitted URLs, cookies, and credentials.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        }
+      ]
+    },
+    {
+      "id": "claim_297145e700874358aeab40ca2fc35879",
+      "statement": "Primary code lives in app/main.py; server-rendered UI helpers live in app/views.py; shared styling and queue JavaScript live in app/static/; tests live in tests/test_app.py; and the Firefox extension lives in extensions/firefox-rdd/.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://app/main.py",
+          "version": "repo-file-v1:sha256:866e825f835317c921b1209a4e893942ecee06534cecefa06f78091cab8faa6e"
+        },
+        {
+          "resource": "repo://app/views.py",
+          "version": "repo-file-v1:sha256:25a843f6939b4b5010bc13c54a6b7138f7fb7d3b7cad420b9d77a1b848e36941"
+        },
+        {
+          "resource": "repo://tests/test_app.py",
+          "version": "repo-file-v1:sha256:996c3847cf82828bdec3ff431f91cc402d633ab0f8e9f97e6dcc074cebef4f3a"
+        }
+      ]
+    },
+    {
+      "id": "claim_63e33ef14f634b09ac56c5cafaaa1b09",
+      "statement": "The default validation loop uses .venv/bin/python -m pytest -q and mocks Real-Debrid and aria2 behavior.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://tests/test_app.py",
+          "version": "repo-file-v1:sha256:996c3847cf82828bdec3ff431f91cc402d633ab0f8e9f97e6dcc074cebef4f3a"
+        }
+      ]
+    },
+    {
+      "id": "claim_bdc91a0fcb88437ea482bdb565d78a0b",
+      "statement": "compose.example.yml is the portable self-hosting reference, while Grace Compose wiring, Traefik labels, host mounts, monitoring, and operator docs belong in unraid and home-ops-docs.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://compose.example.yml",
+          "version": "repo-file-v1:sha256:6e998b3ef3c53fe76a925e7638778e86084843950a3e8b4d9f649d0d09c773e7"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.4.3",
+    "at": "2026-08-27T23:21:28.898Z"
+  }
+}

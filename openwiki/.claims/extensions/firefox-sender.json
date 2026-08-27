@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:2a86febbe06149c759f2cb522329552d15828153e996d520643ff2f0337971c6",
+  "claims": [
+    {
+      "id": "claim_ca8546dfe5994d52a8b1a8384676ae27",
+      "statement": "The local Firefox WebExtension lives in extensions/firefox-rdd, is named RDD Sender, and is intended for signed, self-distributed installs rather than public listing.",
+      "evidence": [
+        {
+          "resource": "repo://extensions/firefox-rdd/README.md",
+          "version": "repo-file-v1:sha256:bf6cd0e03eb8b7f3df0b15df1d875c813fb8fc658c3760358d97fd1dd20ccd0d"
+        },
+        {
+          "resource": "repo://extensions/firefox-rdd/manifest.json",
+          "version": "repo-file-v1:sha256:224fef90f4a3be273eaa130d96a5b9e80b4869a4adb4a23453346d9953577a0e"
+        }
+      ]
+    },
+    {
+      "id": "claim_9e7c095b097c4d3f81c0851db4163dc8",
+      "statement": "The extension adds context-menu actions for sending a link or selected text to the configured Real-Debrid Downloader instance.",
+      "evidence": [
+        {
+          "resource": "repo://extensions/firefox-rdd/README.md",
+          "version": "repo-file-v1:sha256:bf6cd0e03eb8b7f3df0b15df1d875c813fb8fc658c3760358d97fd1dd20ccd0d"
+        },
+        {
+          "resource": "repo://extensions/firefox-rdd/background.js",
+          "version": "repo-file-v1:sha256:e8504228ce310b818d31ed2c4a8d78cb4f5e6e2510c989f653c26447f533b869"
+        }
+      ]
+    },
+    {
+      "id": "claim_f27f7077dfa94d74ac2cf3fae4e7f6bc",
+      "statement": "background.js submits selected values to POST /api/submit, and options.js tests connectivity with GET /api/version.",
+      "evidence": [
+        {
+          "resource": "repo://extensions/firefox-rdd/README.md",
+          "version": "repo-file-v1:sha256:bf6cd0e03eb8b7f3df0b15df1d875c813fb8fc658c3760358d97fd1dd20ccd0d"
+        },
+        {
+          "resource": "repo://extensions/firefox-rdd/background.js",
+          "version": "repo-file-v1:sha256:e8504228ce310b818d31ed2c4a8d78cb4f5e6e2510c989f653c26447f533b869"
+        },
+        {
+          "resource": "repo://extensions/firefox-rdd/options.js",
+          "version": "repo-file-v1:sha256:89559a21d5c3b2556e912e6c436554566e7830c5b64ec73ac57bd5d7519a7336"
+        }
+      ]
+    },
+    {
+      "id": "claim_9875445fbb4149de95322e503e87ea20",
+      "statement": "The extension manifest uses WebExtension manifest v3, a stable Gecko ID, menus, notifications, and storage permissions, plus optional http and https host permissions.",
+      "evidence": [
+        {
+          "resource": "repo://extensions/firefox-rdd/manifest.json",
+          "version": "repo-file-v1:sha256:224fef90f4a3be273eaa130d96a5b9e80b4869a4adb4a23453346d9953577a0e"
+        }
+      ]
+    },
+    {
+      "id": "claim_211298d0c93e4c6384b21d5157a97b11",
+      "statement": "The extension stores only the configured RDD base URL and does not store Real-Debrid tokens, aria2 RPC secrets, submitted URLs, generated direct download URLs, or cookies.",
+      "evidence": [
+        {
+          "resource": "repo://extensions/firefox-rdd/README.md",
+          "version": "repo-file-v1:sha256:bf6cd0e03eb8b7f3df0b15df1d875c813fb8fc658c3760358d97fd1dd20ccd0d"
+        },
+        {
+          "resource": "repo://extensions/firefox-rdd/background.js",
+          "version": "repo-file-v1:sha256:e8504228ce310b818d31ed2c4a8d78cb4f5e6e2510c989f653c26447f533b869"
+        },
+        {
+          "resource": "repo://extensions/firefox-rdd/options.js",
+          "version": "repo-file-v1:sha256:89559a21d5c3b2556e912e6c436554566e7830c5b64ec73ac57bd5d7519a7336"
+        }
+      ]
+    },
+    {
+      "id": "claim_73f098b43dd74b1d9788bfccf93b7edf",
+      "statement": "extensions/firefox-rdd/package.json provides web-ext lint, build, and unlisted sign scripts, and the extension version must match app/__init__.py before signing.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://extensions/firefox-rdd/README.md",
+          "version": "repo-file-v1:sha256:bf6cd0e03eb8b7f3df0b15df1d875c813fb8fc658c3760358d97fd1dd20ccd0d"
+        },
+        {
+          "resource": "repo://extensions/firefox-rdd/package.json",
+          "version": "repo-file-v1:sha256:657f5c2a37c9c2394d1fb0330a457a2a374295ed09f1b949c66be03e66e33586"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.4.3",
+    "at": "2026-08-27T23:21:28.898Z"
+  }
+}

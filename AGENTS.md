@@ -48,8 +48,11 @@ The initial scaffold is intentionally minimal. Implement the production flow beh
 
 ## OpenWiki
 
-OpenWiki instructions live in `openwiki/INSTRUCTIONS.md`. Generated OpenWiki pages are optional just-in-time LLM context, not required startup reading.
+This repository has a generated `openwiki/` evidence index. It is optional just-in-time context, not required startup reading.
 
-Do not hand-edit generated OpenWiki pages unless explicitly asked; prefer updating source code, tests, app docs, or `home-ops-docs` and letting OpenWiki regenerate.
+- Treat source code and tests as authoritative. A brief's unknowns and review items are verification gaps, not automatic requirements.
+- Prefer the narrowest quiet validation that proves the changed behavior. Preserve complete failure output.
+
+The scheduled OpenWiki GitHub Actions workflow refreshes the repository wiki. Do not hand-edit generated OpenWiki pages unless explicitly asked; prefer updating source code/docs and letting OpenWiki regenerate.
 
 <!-- OPENWIKI:END -->

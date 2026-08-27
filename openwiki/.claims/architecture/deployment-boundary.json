@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:c594dad07d86cb667931ca3bfb9f8b78e98ac136dfe3f93a48782a7cfed2aa4b",
+  "claims": [
+    {
+      "id": "claim_26c7ac62dca04dc48bb7508bfee61441",
+      "statement": "The Real-Debrid Downloader repo owns the standalone app source, tests, Dockerfile, compose example, Firefox extension, and image publishing workflows.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        }
+      ]
+    },
+    {
+      "id": "claim_760c6b55df01484ea07b34d8cc03a534",
+      "statement": "App docs and examples must stay self-hostable and avoid private Grace hostnames, internal paths, and operator-specific assumptions.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        }
+      ]
+    },
+    {
+      "id": "claim_4cc5360e80ab453783ba4d30a6a2a8d1",
+      "statement": "Dockerfile builds the production image from python:3.12-slim, installs Python dependencies plus 7-Zip, creates /config and /downloads, exposes port 8080, and runs python -m app.main as an unprivileged user.",
+      "evidence": [
+        {
+          "resource": "repo://Dockerfile",
+          "version": "repo-file-v1:sha256:1d1620b8fa85b3f2585debedba78ed31cdde80b61dd71b72b8e0eec3d180ca52"
+        }
+      ]
+    },
+    {
+      "id": "claim_b6f256f7fd1d40f5b5efe837be7067ad",
+      "statement": "compose.example.yml runs rd-downloader and an internal rd-aria2, reads local secrets from .env, maps /config and /downloads, and does not expose aria2's JSON-RPC port to the host.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://compose.example.yml",
+          "version": "repo-file-v1:sha256:6e998b3ef3c53fe76a925e7638778e86084843950a3e8b4d9f649d0d09c773e7"
+        }
+      ]
+    },
+    {
+      "id": "claim_4f17f2532ff04ca492115e07456b322b",
+      "statement": "The production image workflow builds ghcr.io/barryshtpeas/realdebrid-downloader on main, tags, and pull requests, while the dev workflow publishes dev and dev-<shortsha> images from dev or a manually supplied ref.",
+      "evidence": [
+        {
+          "resource": "repo://.github/workflows/container.yml",
+          "version": "repo-file-v1:sha256:8a7b22f73e0b7f1df173e19ab023de2f8f0d8b3ba3bc1ef5785bf421b531413a"
+        },
+        {
+          "resource": "repo://.github/workflows/dev-container.yml",
+          "version": "repo-file-v1:sha256:267d867d034341829a3349baa78dc078cc567fc49a41e5db8ced797b865a4f8c"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        }
+      ]
+    },
+    {
+      "id": "claim_1970d2dba86349898f9c50f440fc3276",
+      "statement": "Grace Compose wiring, Traefik labels, host mounts, live secret files, monitoring, and operator docs belong in unraid and home-ops-docs, not in the app repo.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.4.3",
+    "at": "2026-08-27T23:21:28.898Z"
+  }
+}

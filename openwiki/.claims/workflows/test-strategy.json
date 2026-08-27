@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:019c5d06ef16452ecd143c667106d7bfa9e0483a78b7380f6e39b2742a7dc447",
+  "claims": [
+    {
+      "id": "claim_d3a5fe9aa08a430f9f4b50a3b24d6953",
+      "statement": "The default Python test suite should be run with .venv/bin/python -m pytest -q rather than assuming a global pytest command is installed.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        }
+      ]
+    },
+    {
+      "id": "claim_8141ebef50fd46e1a144417a0d23a421",
+      "statement": "The default test suite uses mocked Real-Debrid API and aria2 JSON-RPC behavior and does not require a live Real-Debrid account, live aria2 instance, API token, or production download path.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://tests/test_app.py",
+          "version": "repo-file-v1:sha256:996c3847cf82828bdec3ff431f91cc402d633ab0f8e9f97e6dcc074cebef4f3a"
+        }
+      ]
+    },
+    {
+      "id": "claim_2f6b5ce517a049b6a3d4801075d0ab0e",
+      "statement": "tests/test_app.py covers health and version endpoints, OpenAPI exposure, settings parsing, hoster submission, magnet and torrent submission, playback behavior, queue actions, multipart grouping, extraction flow, and sanitized API responses.",
+      "evidence": [
+        {
+          "resource": "repo://tests/test_app.py",
+          "version": "repo-file-v1:sha256:996c3847cf82828bdec3ff431f91cc402d633ab0f8e9f97e6dcc074cebef4f3a"
+        }
+      ]
+    },
+    {
+      "id": "claim_81505133c2ff4b00bf30bdd31d88b7ed",
+      "statement": "The test suite checks Firefox extension packaging expectations including manifest v3, version match with app/__init__.py, stable Gecko ID, permissions, release tooling, and absence of private or operator-specific defaults.",
+      "evidence": [
+        {
+          "resource": "repo://tests/test_app.py",
+          "version": "repo-file-v1:sha256:996c3847cf82828bdec3ff431f91cc402d633ab0f8e9f97e6dcc074cebef4f3a"
+        }
+      ]
+    },
+    {
+      "id": "claim_59a999ca3e0a4ddc818a36fd012c8766",
+      "statement": "Docker or Compose checks should be reported separately because agent or LLM helper containers may not have Docker available.",
+      "evidence": [
+        {
+          "resource": "repo://AGENTS.md",
+          "version": "repo-file-v1:sha256:f794621036ad1353c620615c4e6104d8151383b273c7fa963c89d59fed83462b"
+        },
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.4.3",
+    "at": "2026-08-27T23:21:28.898Z"
+  }
+}

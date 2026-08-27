@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:39e072cd6bd79ad96068e7abd773430b4217a8338f205f4824944043c33b5a52",
+  "claims": [
+    {
+      "id": "claim_940484bf523b4b64b6aaafbb9e8c5360",
+      "statement": "Real-Debrid Downloader is a FastAPI app with a web UI and JSON API for submitting Real-Debrid-supported hoster links and magnet links to an internal aria2 worker.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://app/main.py",
+          "version": "repo-file-v1:sha256:866e825f835317c921b1209a4e893942ecee06534cecefa06f78091cab8faa6e"
+        }
+      ]
+    },
+    {
+      "id": "claim_aac03d0f97b64f60a8a687a48e19791b",
+      "statement": "Hoster download submissions are checked against Real-Debrid host metadata when available, checked with /unrestrict/check, unrestricted with /unrestrict/link, and submitted to aria2 over JSON-RPC.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://app/main.py",
+          "version": "repo-file-v1:sha256:866e825f835317c921b1209a4e893942ecee06534cecefa06f78091cab8faa6e"
+        }
+      ]
+    },
+    {
+      "id": "claim_dd8ce15e313944c7ab104f6380dd0b45",
+      "statement": "Magnet submissions call Real-Debrid torrent endpoints to add the magnet, read torrent info, select all files, wait for generated links, unrestrict each link, and submit resulting downloads to aria2.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://app/main.py",
+          "version": "repo-file-v1:sha256:866e825f835317c921b1209a4e893942ecee06534cecefa06f78091cab8faa6e"
+        }
+      ]
+    },
+    {
+      "id": "claim_667421c665434b23af1ed34fed5d1779",
+      "statement": "The Play path supports one streamable hoster URL at a time, creates a process-local playback session, serves a local stream URL, and proxies browser range requests to the Real-Debrid stream.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://app/main.py",
+          "version": "repo-file-v1:sha256:866e825f835317c921b1209a4e893942ecee06534cecefa06f78091cab8faa6e"
+        },
+        {
+          "resource": "repo://app/views.py",
+          "version": "repo-file-v1:sha256:25a843f6939b4b5010bc13c54a6b7138f7fb7d3b7cad420b9d77a1b848e36941"
+        }
+      ]
+    },
+    {
+      "id": "claim_51a5ea317f5d4e38bde03cc4df2c892b",
+      "statement": "Multipart groups are stored in /config/download-groups.json by default and monitored so completed supported archives are extracted with 7-Zip into /downloads/<group-name>/.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://app/main.py",
+          "version": "repo-file-v1:sha256:866e825f835317c921b1209a4e893942ecee06534cecefa06f78091cab8faa6e"
+        }
+      ]
+    },
+    {
+      "id": "claim_ffc01f6fc148400e9644fcae3c1f205a",
+      "statement": "The queue UI is server-rendered and uses Server-Sent Events from /queue/events for live refresh when JavaScript is available.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://app/static/queue.js",
+          "version": "repo-file-v1:sha256:43a49cba47402215d8fa8d6479771e1f390863bb539a04d4109518041d4754b4"
+        },
+        {
+          "resource": "repo://app/views.py",
+          "version": "repo-file-v1:sha256:25a843f6939b4b5010bc13c54a6b7138f7fb7d3b7cad420b9d77a1b848e36941"
+        }
+      ]
+    },
+    {
+      "id": "claim_767a7d82cbf94901a12e7cb4940f2d79",
+      "statement": "Queue and API responses are sanitized so clients do not receive Real-Debrid tokens, aria2 RPC details, full submitted URLs, magnet hashes, generated direct URLs, or local download paths.",
+      "evidence": [
+        {
+          "resource": "repo://README.md",
+          "version": "repo-file-v1:sha256:5de3a76ddc0b27c911fef9257302fb66808c4fb9fe3782903b0e29502b558e65"
+        },
+        {
+          "resource": "repo://app/main.py",
+          "version": "repo-file-v1:sha256:866e825f835317c921b1209a4e893942ecee06534cecefa06f78091cab8faa6e"
+        },
+        {
+          "resource": "repo://tests/test_app.py",
+          "version": "repo-file-v1:sha256:996c3847cf82828bdec3ff431f91cc402d633ab0f8e9f97e6dcc074cebef4f3a"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.4.3",
+    "at": "2026-08-27T23:21:28.898Z"
+  }
+}
